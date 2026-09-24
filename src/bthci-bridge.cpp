@@ -366,6 +366,15 @@ static binder_status_t cbOnTransact(AIBinder*, transaction_code_t code, const AP
   return ST_OK;
 }
 
+static int halPid() {
+  FILE* f = popen("pidof android.hardware.bluetooth@aidl-service-qti 2>/dev/null | awk '{print $1}'", "r");
+  if (!f) return -1;
+  int pid = -1;
+  if (fscanf(f, "%d", &pid) != 1) pid = -2;
+  pclose(f);
+  return pid;
+}
+
 static binder_status_t callVoid(uint32_t code, bool oneway) {
   AParcel* in = nullptr;
   binder_status_t st = ndk.Prepare(g_hal, &in);
@@ -378,7 +387,7 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
-  bool probe4 = false, probe5 = false;
+  bool probe4 = false, probe5 = false, probeEnable = false;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
       probe4 = true;
@@ -386,6 +395,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[i], "--probe5")) {
       probe5 = true;
+      continue;
+    }
+    if (!strcmp(argv[i], "--probe-enable")) {
+      probeEnable = true;
       continue;
     }
     if (!strcmp(argv[i], "--keep") && i + 1 < argc)
@@ -476,8 +489,48 @@ int main(int argc, char** argv) {
     return st;
   };
 
+  // 只读判据：HAL 有没有把 glink/UART 打开（=它真的开始上电了）
+  auto halOpenTransport = []() -> int {
+    char cmd[128];
+    snprintf(cmd, sizeof(cmd), "ls /proc/%d/fd 2>/dev/null | wc -l", halPid());
+    FILE* f = popen(cmd, "r");
+    if (!f) return -1;
+    int n = -1;
+    if (fscanf(f, "%d", &n) != 1) n = -2;
+    pclose(f);
+    return n;
+  };
+  auto rfkillSoft = []() -> int {
+    FILE* f = fopen("/sys/class/rfkill/rfkill0/soft", "r");
+    if (!f) return -1;
+    int v = -2;
+    if (fscanf(f, "%d", &v) != 1) v = -3;
+    fclose(f);
+    return v;
+  };
+
   int initialized = 0;
-  if (probe4) {
+  if (probeEnable) {
+    // initialize 必须已经成功才有意义
+    int32_t first = 0x7abc;
+    binder_status_t ist = callWith(kInitialize, true, 0, &first);
+    log("probe-enable: initialize → %d 回包首int32=%d", ist, first);
+    if (ist != ST_OK) return 1;
+    struct Att { const char* name; int reason; };
+    static const Att atts[] = {
+        {"无参", -1}, {"reason=0", 0}, {"reason=1", 1}, {"reason=2", 2}, {"reason=3", 3},
+    };
+    for (const auto& a : atts) {
+      binder_status_t st = callWith(kEnable, false, FLAG_ONEWAY, nullptr, a.reason);
+      std::this_thread::sleep_for(std::chrono::seconds(4));
+      int soft = rfkillSoft();
+      int fds = halOpenTransport();
+      log("probe-enable enable/%-9s oneway st=%d → rfkill0.soft=%d HALfd=%d %s", a.name, st, soft,
+          fds, soft == 0 ? "★ 已上电" : "");
+      if (soft == 0) break;
+    }
+    initialized = 1;
+  } else if (probe4) {
     struct Case { const char* name; uint32_t code; bool withCb; uint32_t flags; };
     static const Case cases[] = {
         {"enable/sync/无参", kEnable, false, 0},
