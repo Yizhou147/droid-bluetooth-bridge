@@ -456,7 +456,7 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
-  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false, search3 = false, search4 = false, search5 = false;
+  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false, search3 = false, search4 = false, search5 = false, search6 = false;
   int mapCode = 0;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
@@ -469,6 +469,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[i], "--map") && i + 1 < argc) {
       mapCode = atoi(argv[++i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "--search6")) {
+      search6 = true;
       continue;
     }
     if (!strcmp(argv[i], "--search5")) {
@@ -640,6 +644,65 @@ int main(int argc, char** argv) {
   };
 
   int initialized = 0;
+  if (search6) {
+    // S5 的错在于用 oneway 探测——oneway 拿不到任何服务端错误（st=0 只代表排队），
+    // 而 S2/S3 已经证明**同步**调用会给出精确信号（-61 缺数据 / -12 长度不对 / 0 形状对）。
+    // 这轮：同步发 byte[] 负载，读回包首 int32；EX_NONE(0) 且 fd=2 ⇒ 命中 sendHciCommand。
+    static const uint8_t resetWith[4] = {0x01, 0x03, 0x0C, 0x00};
+    static const uint8_t resetWo[3] = {0x03, 0x0C, 0x00};
+    bool found = false;
+    for (int it = 1; it >= 0 && !found; it--) {
+      for (uint32_t code = 1; code <= 10 && !found; code++) {
+        if (!acquire()) continue;
+        binder_status_t ia = callWith(2, true, 0, nullptr);
+        int fd1 = halTransportFds();
+        g_cbEvents = 0;
+        AParcel* in = nullptr;
+        binder_status_t st = ndk.Prepare(g_hal, &in);
+        int32_t first = 0x7abc;
+        if (st == ST_OK) {
+          const uint8_t* pl = it ? resetWith : resetWo;
+          size_t n = it ? sizeof(resetWith) : sizeof(resetWo);
+          st = ndk.Parcel_writeByteArray(in, reinterpret_cast<const int8_t*>(pl), n);
+          if (st == ST_OK) {
+            AParcel* out = nullptr;
+            st = ndk.Transact(g_hal, code, &in, &out, 0);  // 同步！
+            if (out) {
+              if (ndk.Parcel_setDataPosition) ndk.Parcel_setDataPosition(out, 0);
+              if (ndk.Parcel_readInt32) ndk.Parcel_readInt32(out, &first);
+              ndk.Parcel_delete(out);
+            }
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        log("S6 type=%d code=%-2u initA=%d fd=%d → 同步st=%d 回包首=%d event=%llu", it, code, ia, fd1,
+            st, first, (unsigned long long)g_cbEvents);
+        if (st == ST_OK && (first == 0 || g_cbEvents > 0)) {
+          g_cmdCode = code;
+          g_include_type = (it == 1);
+          initialized = 1;
+          found = true;
+          log("★★★ sendHciCommand = code %u（负载%s类型字节）", code, it ? "含" : "不含");
+        }
+      }
+    }
+    if (!found) { log("✗ S6 同步探测也没命中（码位>10 或另有前置条件）"); return 1; }
+    kickHci(1);
+    for (int k = 0; k < 10; k++) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      struct pollfd pf{g_mfd, POLLIN, 0};
+      if (poll(&pf, 1, 200) > 0 && (pf.revents & POLLIN)) pumpToHal();
+    }
+    {
+      char cmd[224];
+      snprintf(cmd, sizeof(cmd),
+               "P=$(ps -A -o PID,NAME | grep -w bluetoothd | head -1 | cut -d' ' -f1); "
+               "nsenter -t $P -m -p -- /usr/bin/hciconfig -a 2>/dev/null | head -3");
+      FILE* g = popen(cmd, "r");
+      if (g) { char ln[256]; while (fgets(ln, sizeof(ln), g)) fprintf(stderr, "[bthci] HCICFG| %s", ln); pclose(g); }
+    }
+    return 0;
+  }
   if (search5) {
     // §17 修正版：每组都是完整序列 acquire → initialize_aidl(2,sync,带回调)，
     // 然后**我们自己注入一条 HCI_Reset**（不依赖内核何时发），
