@@ -30,22 +30,26 @@ jobs:
 
       - name: 定位或安装 NDK
         run: |
-          set -euo pipefail
+          set -uo pipefail
           CC_REL="toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang++"
           found=""
-          # 1) 预装的（GitHub runner 一直带 NDK，版本随镜像变）
-          for base in ${ANDROID_NDK_HOME:-} ${ANDROID_NDK_PATH:-} \
-                      "$HOME/android-sdk/ndk" "$HOME/Android/Sdk/ndk" \
-                      ${ANDROID_HOME:-/usr/local/lib/android/sdk}/ndk; do
-            [ -n "$base" ] || continue
-            if [ -x "$base/$CC_REL" ]; then found="$base"; break; fi
-            for c in "$base"/*; do
-              [ -x "$c/$CC_REL" ] && { found="$c"; break; }
-            done
-            [ -n "$found" ] && break
-          done
-          # 2) 没有就自己装一个确实存在的版本
+          if [ -n "${ANDROID_NDK_HOME:-}" ] && [ -d "$ANDROID_NDK_HOME" ]; then
+            found="$ANDROID_NDK_HOME"
+          fi
           if [ -z "$found" ]; then
+            for c in /usr/local/lib/android/sdk/ndk/* "$HOME/android-sdk/ndk"/*; do
+              if [ -x "$c/$CC_REL" ]; then found="$c"; break; fi
+            done
+          fi
+          if [ -n "$found" ] && [ ! -x "$found/$CC_REL" ]; then
+            echo "ANDROID_NDK_HOME 指向的目录里没有 $CC_REL，改扫候选"
+            found=""
+            for c in /usr/local/lib/android/sdk/ndk/*; do
+              if [ -x "$c/$CC_REL" ]; then found="$c"; break; fi
+            done
+          fi
+          if [ -z "$found" ]; then
+            echo "runner 上没有现成 NDK，回落 sdkmanager 安装"
             command -v java >/dev/null || { echo "回落安装需要 Java，runner 上却没有" >&2; exit 1; }
             export ANDROID_HOME="$PWD/android-sdk"
             mkdir -p "$ANDROID_HOME/cmdline-tools"
@@ -56,10 +60,9 @@ jobs:
             SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
             yes | "$SM" --licenses >/dev/null 2>&1 || true
             "$SM" --update >/dev/null 2>&1 || true
-            for pkg in "ndk;r27.2.12479018" "ndk;27.0.12077973" "ndk;26.3.11579264" "ndk;26.1.10909125" "ndk;25.2.9519653"; do
+            for pkg in "ndk;r27.2.12479018" "ndk;27.0.12077973" "ndk;26.3.11579264"; do
               if "$SM" "$pkg" >/dev/null 2>&1; then
                 found="$ANDROID_HOME/ndk/${pkg#ndk;}"
-                echo "已安装 $pkg"
                 break
               fi
             done
@@ -69,6 +72,7 @@ jobs:
             exit 1
           fi
           echo "使用 NDK：$found"
+          ls "$found/toolchains/llvm/prebuilt/linux-x86_64/bin" | grep -c clang || true
           echo "ANDROID_NDK_HOME=$found" >> "$GITHUB_ENV"
 
       - name: 编译
