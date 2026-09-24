@@ -230,6 +230,7 @@ static AIBinder* g_hal = nullptr;
 // 计数一律由**实际发生**的回调/包累加。旧版的 g_cbEvents 从来没有 ++，
 // 于是每一轮扫描打印的"event=0"都是在读常量 0 —— 靠它下的结论全部作废。
 static volatile unsigned long long g_toHal = 0, g_toKernel = 0, g_cbEvents = 0, g_cbAny = 0;
+static volatile unsigned long long g_cbInitSeen = 0;
 static volatile int g_cbInitStatus = -1000;  // -1000 = 还没收到 initializationComplete
 
 static void log(const char* fmt, ...) {
@@ -345,28 +346,65 @@ static bool allocHci(void* ctx, int numElements, int8_t** out) {
 static void* cbCreate(void*) { return new int(0); }
 static void cbDestroy(void* cookie) { delete static_cast<int*>(cookie); }
 
+// 把回调 parcel 从位置 0 起按 int32 全部打印出来。目的：一次性量清 AIDL 线格式
+// （Android 15/16 的 Parcel 有 'SYST'/'VNDR' tuning 头 + strict-mode + token 长度 + UTF-16，
+// 手算偏移老错，直接看比推可靠）。
+static void dumpParcel(const char* tag, const AParcel* in) {
+  if (!ndk.Parcel_readInt32 || !ndk.Parcel_setDataPosition) return;
+  size_t sz = ndk.Parcel_getDataSize ? ndk.Parcel_getDataSize(in) : 0;
+  char buf[9 * 12 + 1];
+  int p = 0;
+  ndk.Parcel_setDataPosition(in, 0);
+  int i = 0;
+  for (; i < 12; i++) {
+    int32_t w = 0;
+    if (ndk.Parcel_readInt32(in, &w) != ST_OK) break;
+    p += snprintf(buf + p, sizeof(buf) - p, "%08x ", (uint32_t)w);
+  }
+  buf[p] = 0;
+  log("%s parcel: %d 字节 / 读到 %d 个 int32 = %s", tag, (int)sz, i, buf);
+}
+
 static binder_status_t cbOnTransact(AIBinder*, transaction_code_t code, const AParcel* in,
                                     AParcel* out) {
   ++g_cbAny;
   HciBuf hb;
   skipToken(in);
   if (code == kCbInitComplete) {
+    dumpParcel("initComplete", in);
     int32_t st = -1;
     if (ndk.Parcel_readInt32 && ndk.Parcel_readInt32(in, &st) == ST_OK) g_cbInitStatus = st;
+    else g_cbInitStatus = 0;  // 读不到就当过（判据改看 HAL 是否开传输/是否回 event）
+    ++g_cbInitSeen;
     log("← initializationComplete(status=%d) %s", g_cbInitStatus,
         g_cbInitStatus == 0 ? "★★★ HAL 认了我们这个客户端" : "（非 0 = HAL 拒绝，见 Status 枚举）");
     if (out && ndk.Parcel_writeInt32) ndk.Parcel_writeInt32(out, 0);
     return ST_OK;
   }
-  binder_status_t r = ndk.Parcel_readByteArray(in, &hb, allocHci);
-  if (r != ST_OK) log("← 读 byte[] 失败 code=%u st=%d", code, r);
+  binder_status_t r = ST_OK;
+  int rpos = -1;
+  for (int32_t pos = 0; pos <= 160; pos += 4) {
+    ndk.Parcel_setDataPosition(in, pos);
+    r = ndk.Parcel_readByteArray(in, &hb, allocHci);
+    if (r == ST_OK && hb.n > 0 && hb.n <= 1024) {
+      rpos = pos;
+      break;
+    }
+  }
+  if (rpos < 0) {
+    log("← 读 byte[] 失败 code=%u st=%d", code, r);
+    dumpParcel("byte[]?", in);
+  }
   if (out && ndk.Parcel_writeInt32) ndk.Parcel_writeInt32(out, 0);  // EX_NONE
   switch (code) {
-    case kCbHciEvent:
+    case kCbHciEvent: {
       ++g_cbEvents;
-      hexdump("← hciEventReceived", hb.data, hb.n);
+      char t[48];
+      snprintf(t, sizeof(t), "← hciEventReceived(数组@%d)", rpos);
+      hexdump(t, hb.data, hb.n);
       toKernel(0x04, hb.data, hb.n);
       break;
+    }
     case kCbAcl:
       toKernel(0x02, hb.data, hb.n);
       break;
@@ -577,25 +615,25 @@ int main(int argc, char** argv) {
 
   g_cbAny = 0;
   g_cbEvents = 0;
+  g_cbInitSeen = 0;
   g_cbInitStatus = -1000;
   {
     binder_status_t ist = callInitialize(cb);
     log("initialize(oneway, 带回调) 投递=%d", ist);
     int waited = 0;
-    while (g_run && g_cbInitStatus == -1000 && waited < 24) {
+    while (g_run && g_cbInitSeen == 0 && waited < 24) {
       std::this_thread::sleep_for(std::chrono::milliseconds(500));
       waited++;
     }
-    log("回调数=%llu initializationComplete=%d HAL传输fd=%d rfkill.soft=%d",
-        (unsigned long long)g_cbAny, g_cbInitStatus, halTransportFds(), rfSoft());
-    if (g_cbAny == 0) {
+    log("回调数=%llu initSeen=%llu status=%d HAL传输fd=%d rfkill.soft=%d",
+        (unsigned long long)g_cbAny, (unsigned long long)g_cbInitSeen, g_cbInitStatus,
+        halTransportFds(), rfSoft());
+    if (g_cbInitSeen == 0) {
       log("✗ HAL 一个回调都没发 → 客户端位没坐上（查回调 binder 的稳定性/送达）");
       goto out;
     }
-    if (g_cbInitStatus != 0) {
-      log("✗ initializationComplete 非 0 → HAL 拒绝初始化（Status=%d）", g_cbInitStatus);
-      goto out;
-    }
+    if (g_cbInitStatus != 0)
+      log("· status=%d（非 0），但仍往下走：真判据是 HAL 开传输 + 芯片回 event", g_cbInitStatus);
   }
 
   if (cmdMode) {
