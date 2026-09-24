@@ -3,3 +3,4 @@ tools/bthci-bridge
 tools/m1-probe
 tools/*.o
 *.log
+device-libs/
