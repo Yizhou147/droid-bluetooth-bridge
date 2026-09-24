@@ -76,14 +76,23 @@
 #define HCIDEVUP_E 0x400448C9u    // _IOW('H', 201, int)
 #define HCIDEVDOWN_E 0x400448CAu  // _IOW('H', 202, int)
 
+// 让内核打开 hci0（它会立刻发 HCI_Reset）。用容器里的 hciconfig：
+// 实测"未绑定控制 socket + HCIDEVUP"会 ENODEV，而 nsenter 进容器 ns 跑 hciconfig 成功过。
+// hciconfig 会阻塞等 init-complete（超时也照常返回非 0，但命令已发出），所以放后台。
 static int kickHci(int up) {
-  int s = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
-  if (s < 0) return -errno;
-  int id = 0;
-  int r = ioctl(s, up ? HCIDEVUP_E : HCIDEVDOWN_E, &id);
-  int e = errno;
-  close(s);
-  return r < 0 ? -e : 0;
+  char cmd[256];
+  if (up)
+    snprintf(cmd, sizeof(cmd),
+             "P=$(ps -A -o PID,NAME | grep -w bluetoothd | head -1 | cut -d' ' -f1); "
+             "[ -n \"$P\" ] || exit 3; nsenter -t $P -m -p -- /usr/bin/hciconfig hci0 up "
+             ">/dev/null 2>&1 & exit 0");
+  else
+    snprintf(cmd, sizeof(cmd),
+             "P=$(ps -A -o PID,NAME | grep -w bluetoothd | head -1 | cut -d' ' -f1); "
+             "[ -n \"$P\" ] || exit 3; nsenter -t $P -m -p -- /usr/bin/hciconfig hci0 down "
+             ">/dev/null 2>&1");
+  int rc = system(cmd);
+  return rc;
 }
 
 // 自动扫出来的 sendHciCommand / sendAclData 码位（初值是猜的）
@@ -619,7 +628,7 @@ int main(int argc, char** argv) {
       binder_status_t est = callWith(kEnable, false, FLAG_ONEWAY, nullptr, 1);
       int kr = kickHci(1);
       int got = 0;
-      for (int i = 0; i < 6; i++) {
+      for (int i = 0; i < 10; i++) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
         struct pollfd pf{g_mfd, POLLIN, 0};
         if (poll(&pf, 1, 50) > 0 && (pf.revents & POLLIN)) pumpToHal();
