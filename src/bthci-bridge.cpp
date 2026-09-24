@@ -379,13 +379,15 @@ int main(int argc, char** argv) {
 
   if (!loadNdk()) return 1;
 
-  // 先声明目标接口（否则 prepareTransaction 直接 -38）
+  // 给目标接口 define 一个类：既完成 Stability 声明，也当"parcel 工厂"用
+  // （见下面 Path A 的注释）
   const AIBinder_Class* hciCls = ndk.Class_define(kDescHci, noopCreate, noopDestroy, noopTransact);
   if (!hciCls) {
-    log("✗ 无法声明 %s（后续 prepareTransaction 会一直 -38）", kDescHci);
+    log("✗ 无法声明 %s", kDescHci);
     return 1;
   }
-  log("✓ 已在本进程声明接口 %s", kDescHci);
+  AIBinder* hciLocal = ndk.New(hciCls, nullptr);  // descriptor 与 vendor 句柄完全一致的本地 binder
+  log("✓ 已在本进程声明接口 %s（本地替身 %p）", kDescHci, (void*)hciLocal);
 
   const AIBinder_Class* cls = ndk.Class_define(kDescCallbacks, cbCreate, cbDestroy, cbOnTransact);
   if (!cls) {
@@ -413,40 +415,41 @@ int main(int argc, char** argv) {
 
   if (!attachHci()) return 1;
 
-  // 坐 HAL 的客户端位。
-  // -38 = libbinder 的 INVALID_OPERATION，来自 Stability::checkDeclared()：
-  // 从 system 进程拿 vendor 侧 AIDL HAL，必须先对句柄做 forceDowngrade，
-  // 否则 prepareTransaction 直接拒。三种降级依次试，谁通用谁。
+  // 坐 HAL 的客户端位。实测 prepareTransaction(g_hal) 直接 -38(INVALID_OPERATION)：
+  // NDK 这层会拦"从 servicemanager 拿来的 vendor 稳定 binder"（C++ 的 service call 不受此限，
+  // 因为它走 BpBinder::transact）。两条绕法依次试：
+  //   Path A：用同 descriptor 的**本地** binder 当 parcel 工厂（Prepare 会写进正确的
+  //           interface token），再把 parcel 发给 vendor 句柄。
+  //   Path B：in=nullptr 直接 Transact（void 方法可能允许，NDK 内部会自建空 parcel）。
   {
-    static const char* kDg[] = {"", "vendor", "system", "local"};
-    int okIdx = -1;
-    for (int i = 0; i < 4 && okIdx < 0; i++) {
-      if (i > 0) {
-        // 重新取句柄，避免上一次的 stability 标记残留
-        g_hal = ndk.SM_getService(kSvcHci);
-        if (!g_hal) { log("✗ 第%d次取句柄失败", i); break; }
-        void* sym = dlsym(RTLD_DEFAULT, (std::string("AIBinder_forceDowngradeTo") + kDg[i] + "Stability").c_str());
-        if (!sym) { log("  · 无 %s 符号，跳过", kDg[i]); continue; }
-        reinterpret_cast<void (*)(AIBinder*)>(sym)(g_hal);
-        log("  · 已对 HAL 句柄施加 %s-stability", kDg[i]);
-      }
-      AParcel* in = nullptr;
-      binder_status_t s1 = ndk.Prepare(g_hal, &in);
-      binder_status_t s2 = (s1 == ST_OK) ? ndk.Parcel_writeStrongBinder(in, cb) : s1;
-      binder_status_t s3 = (s2 == ST_OK) ? [&] {
-        AParcel* out = nullptr;
-        binder_status_t r = ndk.Transact(g_hal, kInitialize, &in, &out, 0);
-        if (out) ndk.Parcel_delete(out);
-        return r;
-      }() : s2;
-      log("initialize[%s]: prepare=%d writeBinder=%d transact=%d", kDg[i], s1, s2, s3);
-      if (s3 == ST_OK) okIdx = i;
+    AParcel* in = nullptr;
+    binder_status_t s1 = ndk.Prepare(hciLocal, &in);
+    binder_status_t s2 = (s1 == ST_OK) ? ndk.Parcel_writeStrongBinder(in, cb) : s1;
+    AParcel* out = nullptr;
+    binder_status_t s3 = (s2 == ST_OK) ? ndk.Transact(g_hal, kInitialize, &in, &out, 0) : s2;
+    if (out) ndk.Parcel_delete(out);
+    log("Path A initialize: prepare(local)=%d writeBinder=%d transact=%d", s1, s2, s3);
+
+    if (s3 != ST_OK) {
+      AParcel* in2 = nullptr;
+      AParcel* out2 = nullptr;
+      binder_status_t s4 = ndk.Transact(g_hal, kInitialize, &in2, &out2, 0);
+      if (out2) ndk.Parcel_delete(out2);
+      log("Path B initialize(in=nullptr): transact=%d", s4);
+      if (s4 == ST_OK) s3 = s4;
     }
-    if (okIdx < 0) {
-      log("✗ initialize 全部失败（-38=stability 未过 / -ENOSYS=事务码不对）");
+
+    if (s3 != ST_OK) {
+      log("✗ initialize 两条路都不通，停在 -38/-ENOSYS 这一层");
     } else {
-      log("✓ initialize 通过（stability=%s）", kDg[okIdx]);
-      log("enable → %d", callVoid(kEnable, false));
+      log("✓ initialize 通过");
+      // enable 同理：优先走本地工厂
+      AParcel* in = nullptr;
+      binder_status_t e1 = ndk.Prepare(hciLocal, &in);
+      AParcel* out = nullptr;
+      binder_status_t e2 = (e1 == ST_OK) ? ndk.Transact(g_hal, kEnable, &in, &out, 0) : e1;
+      if (out) ndk.Parcel_delete(out);
+      log("enable → %d", e2);
     }
   }
 
