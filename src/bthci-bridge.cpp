@@ -96,6 +96,9 @@ static struct {
   void (*Parcel_delete)(AParcel*);
   void (*Proc_setThreadPoolMaxThreadCount)(uint32_t);
   void (*Proc_startThreadPool)(void);
+  bool (*Binder_isRemote)(AIBinder*);
+  bool (*Binder_isNative)(AIBinder*);
+  int32_t (*Binder_getVendor)(AIBinder*);
   void (*ForceDowngradeToVendorStability)(AIBinder*);  // platform-only，可能没有
 } ndk{};
 
@@ -121,6 +124,9 @@ static bool loadNdk() {
   ndk.Parcel_writeStrongBinder = (decltype(ndk.Parcel_writeStrongBinder))get("AParcel_writeStrongBinder");
   ndk.Parcel_setDataPosition = (decltype(ndk.Parcel_setDataPosition))get("AParcel_setDataPosition");
   ndk.Parcel_delete = (decltype(ndk.Parcel_delete))get("AParcel_delete");
+  ndk.Binder_isRemote = (decltype(ndk.Binder_isRemote))get("AIBinder_isRemote");
+  ndk.Binder_isNative = (decltype(ndk.Binder_isNative))get("AIBinder_isNative");
+  ndk.Binder_getVendor = (decltype(ndk.Binder_getVendor))get("AIBinder_getVendor");
   ndk.Proc_setThreadPoolMaxThreadCount =
       (decltype(ndk.Proc_setThreadPoolMaxThreadCount))get("ABinderProcess_setThreadPoolMaxThreadCount");
   ndk.Proc_startThreadPool = (decltype(ndk.Proc_startThreadPool))get("ABinderProcess_startThreadPool");
@@ -363,10 +369,14 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
-  bool probe4 = false;
+  bool probe4 = false, probe5 = false;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
       probe4 = true;
+      continue;
+    }
+    if (!strcmp(argv[i], "--probe5")) {
+      probe5 = true;
       continue;
     }
     if (!strcmp(argv[i], "--keep") && i + 1 < argc)
@@ -459,6 +469,31 @@ int main(int argc, char** argv) {
       log("PROBE %-26s code=%u flags=%u → st=%d 回包首int32=%d", c.name, c.code, c.flags, st, first);
     }
     initialized = 1;  // 探测模式不再走正式流程
+  } else if (probe5) {
+    // 判定 -38 是不是"vendor flavor"闸：对照 system 侧服务与 vendor HAL
+    struct Target { const char* name; const char* desc; };
+    static const Target ts[] = {
+        {"activity", "android.app.IActivityManager"},
+        {"package", "android.content.pm.IPackageManager"},
+        {"bluetooth_manager", "android.bluetooth.IBluetoothManager"},
+        {"android.hardware.power.IPower/default", "android.hardware.power.IPower"},
+        {kSvcHci, kDescHci},
+    };
+    for (const auto& t : ts) {
+      AIBinder* b = ndk.SM_getService(t.name);
+      if (!b) { log("PROBE5 %-42s getService=NULL", t.name); continue; }
+      if (ndk.Binder_isRemote || ndk.Binder_isNative || ndk.Binder_getVendor)
+        log("PROBE5 %-42s isRemote=%d isNative=%d vendor=%d", t.name,
+            ndk.Binder_isRemote ? (int)ndk.Binder_isRemote(b) : -1,
+            ndk.Binder_isNative ? (int)ndk.Binder_isNative(b) : -1,
+            ndk.Binder_getVendor ? ndk.Binder_getVendor(b) : -1);
+      AParcel* in = nullptr;
+      binder_status_t st = ndk.Prepare(b, &in);
+      log("     → Prepare=%d %s%s", st, st == ST_OK ? "(可发!)" : "",
+          st == -38 ? " (-38=INVALID_OPERATION)" : "");
+      if (in) ndk.Parcel_delete(in);
+    }
+    initialized = 1;
   } else {
     int32_t first = 0x7abc;
     binder_status_t st = callWith(kInitialize, true, 0, &first);
