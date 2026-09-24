@@ -161,6 +161,13 @@ static bool loadNdk() {
 
 // ------------------------------------------------------------ 本程序状态
 static const char* kSvcHci = "android.hardware.bluetooth.IBluetoothHci/default";
+// 探测用的候选服务名（真机可能注册在 HIDL 兼容名或 QTI 专有名下）
+static const char* kSvcVariants[] = {
+    "android.hardware.bluetooth.IBluetoothHci/default",
+    "android.hardware.bluetooth@1.0::IBluetoothHci/default",
+    "android.hardware.bluetooth@aidl-service-qti",
+    "vendor.qti.hardware.bluetooth.IBluetoothHci/default",
+};
 static const char* kDescCallbacks = "android.hardware.bluetooth.IBluetoothHciCallbacks";
 static const char* kDescHci = "android.hardware.bluetooth.IBluetoothHci";
 
@@ -491,8 +498,8 @@ int main(int argc, char** argv) {
 
   // 只读判据：HAL 有没有把 glink/UART 打开（=它真的开始上电了）
   auto halOpenTransport = []() -> int {
-    char cmd[128];
-    snprintf(cmd, sizeof(cmd), "ls /proc/%d/fd 2>/dev/null | wc -l", halPid());
+    char cmd[160];
+    snprintf(cmd, sizeof(cmd), "ls -l /proc/%d/fd 2>/dev/null | grep -cE 'bt_cp_ctrl|ttyHS'", halPid());
     FILE* f = popen(cmd, "r");
     if (!f) return -1;
     int n = -1;
@@ -521,6 +528,21 @@ int main(int argc, char** argv) {
         {"无参", -1}, {"reason=0", 0}, {"reason=1", 1}, {"reason=2", 2}, {"reason=3", 3},
     };
     for (const auto& a : atts) {
+      // 每轮先重新确认句柄：逐个候选服务名试，谁的 initialize 通就用谁
+      for (const char* nm : kSvcVariants) {
+        AIBinder* b = ndk.SM_getService(nm);
+        if (!b) continue;
+        if (ndk.AssociateClass) ndk.AssociateClass(b, hciCls);
+        int32_t f2 = 0x7abc;
+        AParcel* in = nullptr;
+        binder_status_t ps = ndk.Prepare(b, &in);
+        binder_status_t ws = (ps == ST_OK) ? ndk.Parcel_writeStrongBinder(in, cb) : ps;
+        AParcel* out = nullptr;
+        binder_status_t ts2 = (ws == ST_OK) ? ndk.Transact(b, kInitialize, &in, &out, 0) : ws;
+        if (out) ndk.Parcel_delete(out);  // in 由 transact 消费，不能再删
+        log("   · 候选 %-52s prepare=%d init=%d", nm, ps, ts2);
+        if (ts2 == ST_OK) { g_hal = b; break; }
+      }
       binder_status_t st = callWith(kEnable, false, FLAG_ONEWAY, nullptr, a.reason);
       std::this_thread::sleep_for(std::chrono::seconds(4));
       int soft = rfkillSoft();
@@ -547,16 +569,22 @@ int main(int argc, char** argv) {
     initialized = 1;  // 探测模式不再走正式流程
   } else if (probe5) {
     // 判定 -38 是不是"vendor flavor"闸：对照 system 侧服务与 vendor HAL
-    struct Target { const char* name; const char* desc; };
+    struct Target { const char* name; const char* desc; bool variant; };
     static const Target ts[] = {
-        {"activity", "android.app.IActivityManager"},
-        {"package", "android.content.pm.IPackageManager"},
-        {"bluetooth_manager", "android.bluetooth.IBluetoothManager"},
-        {"android.hardware.power.IPower/default", "android.hardware.power.IPower"},
-        {kSvcHci, kDescHci},
+        {"activity", "android.app.IActivityManager", false},
+        {"android.hardware.power.IPower/default", "android.hardware.power.IPower", false},
+        {"蓝牙 HAL（多服务名轮询）", kDescHci, true},
     };
     for (const auto& t : ts) {
-      AIBinder* b = ndk.SM_getService(t.name);
+      AIBinder* b = nullptr;
+      if (t.variant) {
+        for (const char* nm : kSvcVariants) {
+          b = ndk.SM_getService(nm);
+          if (b) { log("     · 命中服务名 %s", nm); break; }
+        }
+      } else {
+        b = ndk.SM_getService(t.name);
+      }
       if (!b) { log("PROBE5 %-42s getService=NULL", t.name); continue; }
       if (ndk.Binder_isRemote || ndk.Binder_isNative || ndk.Binder_getVendor)
         log("PROBE5 %-42s isRemote=%d isNative=%d vendor=%d", t.name,
