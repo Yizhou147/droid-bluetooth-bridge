@@ -181,9 +181,23 @@ static binder_status_t noopTransact(AIBinder*, transaction_code_t, const AParcel
   return ST_OK;
 }
 
-// IBluetoothHci 方法码 = 声明顺序（1 initialize 2 enable 3 disable 4 close
-// 5 sendHciCommand 6 sendAclData 7 sendScoData）
-enum : uint32_t { kInitialize = 1, kEnable = 2, kDisable = 3, kClose = 4, kSendCommand = 5, kSendAcl = 6, kSendSco = 7 };
+// IBluetoothHci 方法码 —— **本机实测得出**，与 AOSP 早期顺序不同：
+//   发 code 2 的那一刻 HAL 打了 BluetoothHci::close() → 2=close
+//   无参调 2 还报 BAD_TYPE（close 不收参数，多余的 int 被 enforceNoDataAvail 拒）
+// 故本机的声明顺序是：initialize, close, enable(EnableReason), disable(DisableReason),
+//                      sendHciCommand, sendAclData, sendScoData
+enum : uint32_t {
+  kInitialize = 1,
+  kClose = 2,
+  kEnable = 3,
+  kDisable = 4,
+  kSendCommand = 5,
+  kSendAcl = 6,
+  kSendSco = 7,
+};
+// EnableReason / DisableReason 枚举值（AIDL）：0=OTHER/UNKNOWN，1/2/3 为其它原因；
+// 先按 0 发，不行再挨个试。
+static const int32_t kEnableReasons[] = {0, 1, 2, 3};
 // 回调方法码（1 transportReset 2 hciEvent 3 aclDataReceived 4 scoDataReceived 6 flowStatus）
 enum : uint32_t { kCbTransportReset = 1, kCbHciEvent = 2, kCbAcl = 3, kCbSco = 4, kCbFlowStatus = 6 };
 
@@ -640,6 +654,28 @@ int main(int argc, char** argv) {
       log("✗ initialize 三种打法都不通（enable 未试）");
     } else {
       initialized = 1;
+      // enable(code 3) 带 EnableReason；oneway 的 st=0 只代表投递成功，
+      // 真判据是 HAL 有没有重新打开 bt_cp_ctrl/ttyHS 以及 rfkill0 是否解除阻塞。
+      {
+        bool up = false;
+        for (int32_t r : kEnableReasons) {
+          binder_status_t est = callWith(kEnable, false, FLAG_ONEWAY, nullptr, r);
+          std::this_thread::sleep_for(std::chrono::seconds(4));
+          int soft = -1, fds = -1;
+          {
+            FILE* f = fopen("/sys/class/rfkill/rfkill0/soft", "r");
+            if (f) { if (fscanf(f, "%d", &soft) != 1) soft = -2; fclose(f); }
+            char cmd[160];
+            snprintf(cmd, sizeof(cmd), "ls -l /proc/%d/fd 2>/dev/null | grep -cE 'bt_cp_ctrl|ttyHS'", halPid());
+            FILE* g = popen(cmd, "r");
+            if (g) { if (fscanf(g, "%d", &fds) != 1) fds = -2; pclose(g); }
+          }
+          log("enable(reason=%d, code=%u) st=%d → rfkill0.soft=%d HAL传输fd=%d %s", r, kEnable, est,
+              soft, fds, (soft == 0 || fds > 0) ? "★ HAL 开始上电/开传输" : "");
+          if (soft == 0 || fds > 0) { up = true; break; }
+        }
+        if (!up) log("✗ enable(reason 0..3) 都没让 HAL 开传输——方法表或 stability 还得再查");
+      }
       // enable 在新版 AIDL 里是 oneway（同步调会 EX_TRANSACTION_FAILED=-2147483647，实测如此）
       int32_t ef = 0x7abc;
       binder_status_t est = callWith(kEnable, false, FLAG_ONEWAY, nullptr);
