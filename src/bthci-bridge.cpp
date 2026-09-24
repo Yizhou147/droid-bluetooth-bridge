@@ -147,6 +147,17 @@ static bool loadNdk() {
 // ------------------------------------------------------------ 本程序状态
 static const char* kSvcHci = "android.hardware.bluetooth.IBluetoothHci/default";
 static const char* kDescCallbacks = "android.hardware.bluetooth.IBluetoothHciCallbacks";
+static const char* kDescHci = "android.hardware.bluetooth.IBluetoothHci";
+
+// AIBinder_Class_define 的副作用就是把 descriptor 在本进程"声明"（Stability::declare）。
+// 不声明的话 AIBinder_prepareTransaction 直接返回 -38(INVALID_OPERATION)：
+// libbinder 的 Stability::checkDeclared(descriptor) 不过。AIDL 生成的桩本来会替你做这件事，
+// 我们手写就得自己补一次——给目标接口 define 个永不服务的哑类即可（实测 prepare=-38 定位）。
+static void* noopCreate(void*) { return new int(0); }
+static void noopDestroy(void* c) { delete static_cast<int*>(c); }
+static binder_status_t noopTransact(AIBinder*, transaction_code_t, const AParcel*, AParcel*) {
+  return ST_OK;
+}
 
 // IBluetoothHci 方法码 = 声明顺序（1 initialize 2 enable 3 disable 4 close
 // 5 sendHciCommand 6 sendAclData 7 sendScoData）
@@ -367,6 +378,14 @@ int main(int argc, char** argv) {
   signal(SIGPIPE, SIG_IGN);
 
   if (!loadNdk()) return 1;
+
+  // 先声明目标接口（否则 prepareTransaction 直接 -38）
+  const AIBinder_Class* hciCls = ndk.Class_define(kDescHci, noopCreate, noopDestroy, noopTransact);
+  if (!hciCls) {
+    log("✗ 无法声明 %s（后续 prepareTransaction 会一直 -38）", kDescHci);
+    return 1;
+  }
+  log("✓ 已在本进程声明接口 %s", kDescHci);
 
   const AIBinder_Class* cls = ndk.Class_define(kDescCallbacks, cbCreate, cbDestroy, cbOnTransact);
   if (!cls) {
