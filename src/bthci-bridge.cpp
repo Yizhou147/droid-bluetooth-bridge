@@ -454,7 +454,7 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
-  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false;
+  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false;
   int mapCode = 0;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
@@ -467,6 +467,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[i], "--map") && i + 1 < argc) {
       mapCode = atoi(argv[++i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "--search2")) {
+      search2 = true;
       continue;
     }
     if (!strcmp(argv[i], "--search")) {
@@ -622,6 +626,32 @@ int main(int argc, char** argv) {
   };
 
   int initialized = 0;
+  if (search2) {
+    // §16：矩阵漏掉的维度——之前全用 oneway 发，但服务端曾对我们标 oneway 的调用**回包**，
+    // 说明这些方法是同步的。这轮一律**同步发送并读回包首 int32**：
+    //   0=EX_NONE(命中且执行) / 2,3=参数形状不对 / -38=码位不对；同时轮询 HAL fd 作第二判据。
+    struct Cand { uint32_t code; int arg; };
+    static const Cand cands[] = {{2, -1}, {2, 1}, {3, -1}, {3, 1},
+                                 {4, -1}, {4, 1}, {5, -1}, {5, 1}};
+    int hit = -1;
+    for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]) && hit < 0; i++) {
+      if (!acquire()) { log("S2 code=%u 占位失败", cands[i].code); continue; }
+      int32_t first = 0x7abc;
+      binder_status_t st = callWith(cands[i].code, false, 0, &first, cands[i].arg);
+      int fds = 0;
+      for (int k = 0; k < 6; k++) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        fds = halTransportFds();
+        if (fds > 0) break;
+      }
+      log("S2 code=%u arg=%-3d 同步 st=%d 回包首int32=%d → HALfd=%d %s", cands[i].code, cands[i].arg,
+          st, first, fds, (st == ST_OK && first == 0) || fds > 0 ? "★★★ 命中" : "");
+      if ((st == ST_OK && first == 0) || fds > 0) hit = (int)cands[i].code;
+    }
+    if (hit < 0) { log("✗ 同步矩阵 8 组也没命中"); return 1; }
+    log("★ 同步矩阵命中 code=%d", hit);
+    return 0;
+  }
   if (search) {
     // **一因一果**：一次 acquire 只发一个 enable 候选，判据只用 HAL 是否打开传输 fd
     // （0→>0），轮询 7 秒（上电要 ~1s，§15 记录过一次误判）。不做 hciconfig down，
