@@ -27,7 +27,13 @@ extern "C" AIBinder* AServiceManager_getService(const char* instance);
 extern "C" AIBinder* AServiceManager_waitForService(const char* instance);
 #endif
 #include <android/binder_parcel.h>
+#if __has_include(<android/binder_process.h>)
 #include <android/binder_process.h>
+#else
+// 同上：个别 NDK 不装这个头，符号在 libbinder_ndk.so 里（API 29+）
+extern "C" void ABinderProcess_setThreadPoolMaxThreadCount(uint32_t numThreads);
+extern "C" void ABinderProcess_startThreadPool(void);
+#endif
 #include <android/binder_status.h>
 
 #include <atomic>
