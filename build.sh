@@ -16,7 +16,9 @@ case "$OS" in
     *)                     HOST_TAG="linux-x86_64" ;;
 esac
 
-# API 33：需要 AServiceManager_getService（31+）与 AParcel_readByteArray 稳定签名
+# 不链 -lbinder_ndk：runner 那份 NDK 的 stub 不导出 AServiceManager_*/ABinderProcess_*，
+# 改成运行时 dlopen + dlsym（设备上的 /system/lib64/libbinder_ndk.so 是全的）。
+# API 33：AServiceManager_getService 需要 31+
 CC="$NDK/toolchains/llvm/prebuilt/$HOST_TAG/bin/aarch64-linux-android33-clang++"
 [ -x "$CC" ] || { echo "找不到编译器：$CC" >&2; exit 1; }
 
@@ -24,6 +26,6 @@ mkdir -p out
 "$CC" -std=c++17 -O2 -Wall -Wextra -Wno-unused-parameter \
     -fPIE -pie -static-libstdc++ \
     src/bthci-bridge.cpp -o out/bthci-bridge \
-    -lbinder_ndk -llog
+    -llog
 
 ls -l out/bthci-bridge

@@ -1,52 +1,30 @@
-// bthci-bridge.cpp — DRM 接管期的蓝牙 HCI 桥（NDK/libbinder_ndk 版）
+// bthci-bridge.cpp — DRM 接管期的蓝牙 HCI 桥（vendor IBluetoothHci 的 binder 客户端）
 //
 // 一个进程干两件事（在安卓侧以 root 运行）：
 //   1) 开一对 pty，在 slave 上挂 N_HCI + HCIUARTSETPROTO(H4) → 在共享内核里注册出真 hci0
 //      （已实测：零新内核模块；进程退出 → tty 关闭 → hci_unregister_dev 自动回收）
-//   2) 做 vendor HAL 的 binder 客户端：AServiceManager_getService("…IBluetoothHci/default")
-//      → initialize(我们的回调) → enable → 把 pty 上的 H4 帧与 HAL 双向搬运
+//   2) 做 vendor 蓝牙 HAL 的 binder 客户端：initialize(我们的回调) → enable →
+//      把 pty 上的 H4 帧与 HAL 双向搬运。上电/固件下载/glink 全部仍由 HAL 负责。
 //
-// 为什么不自己拼 binder 事务：Android 15/16 的 libbinder 在 Parcel 里加了 'SYST'/'VNDR'
-// tuning header（由 Parcel::write 序列化，手写客户端伪造不出来 → servicemanager 直接
-// 回 EX_SECURITY）。详见 蓝牙原生方案.md §11。用 AIBinder_prepareTransaction 就彻底交给
-// 平台自己写头，我们只负责参数。
+// 为什么用 dlopen 而不是 -lbinder_ndk：GitHub runner 上那份 NDK 没有 binder_manager.h /
+// binder_process.h，其 libbinder_ndk.so stub 也不导出 ABinderProcess_*/AServiceManager_*
+// （CI 实测 undefined symbol）。设备上的 /system/lib64/libbinder_ndk.so 是全的 →
+// 运行时 dlopen + 自己声明原型，彻底不依赖 NDK 头与 stub，头文件漂移这一整类失败消失。
 //
 // 绝对不做：不 open /dev/bt_cp_ctrl、不 open /dev/ttyHS0、不打任何 btpower/geni 电源 ioctl、
-// 不碰 /sys/class/rfkill/rfkill0 —— 上电与固件下载是 HAL 的职责，我们越界就是把平板搞重启。
+// 不写 /sys/class/rfkill/rfkill0、不 setenforce 0。
 //
-// 编译：见 .github/workflows/build-bthci.yml（NDK r27，aarch64，c++_static）
+// 编译：sh build.sh（NDK；本机 arm64 无 NDK → 由 .github/workflows/build.yml 云端构建）
 // 运行：adb push bthci-bridge /data/local/tmp/
 //       adb shell su -c '/data/local/tmp/bthci-bridge --keep 3600'
 
-#include <android/binder_ibinder.h>
-#if __has_include(<android/binder_manager.h>)
-#include <android/binder_manager.h>
-#else
-// 某些 NDK 版本不装 binder_manager.h；符号本身在 libbinder_ndk.so 里（API 31+）
-extern "C" AIBinder* AServiceManager_getService(const char* instance);
-extern "C" AIBinder* AServiceManager_waitForService(const char* instance);
-#endif
-#include <android/binder_parcel.h>
-#if __has_include(<android/binder_process.h>)
-#include <android/binder_process.h>
-#else
-// 同上：个别 NDK 不装这个头，符号在 libbinder_ndk.so 里（API 29+）
-extern "C" void ABinderProcess_setThreadPoolMaxThreadCount(uint32_t numThreads);
-extern "C" void ABinderProcess_startThreadPool(void);
-#endif
-#include <android/binder_status.h>
-
-#include <atomic>
-#include <chrono>
-#include <cstdarg>
 #include <cerrno>
 #include <cinttypes>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
-#include <string>
-#include <thread>
 #include <vector>
 
 #include <dlfcn.h>
@@ -58,11 +36,16 @@ extern "C" void ABinderProcess_startThreadPool(void);
 #include <termios.h>
 #include <unistd.h>
 
+#include <chrono>
+
 #ifndef TIOCSETD
 #define TIOCSETD 0x541b
 #endif
 #ifndef N_HCI
 #define N_HCI 15
+#endif
+#ifndef N_TTY
+#define N_TTY 0
 #endif
 #ifndef TIOCGPTN
 #define TIOCGPTN 0x80045430
@@ -78,29 +61,104 @@ extern "C" void ABinderProcess_startThreadPool(void);
 #endif
 #define HCI_UART_H4 0
 
-static constexpr const char* kSvcHci = "android.hardware.bluetooth.IBluetoothHci/default";
-static constexpr const char* kDescCallbacks = "android.hardware.bluetooth.IBluetoothHciCallbacks";
+// ------------------------------------------------------------ libbinder_ndk 的最小声明
+struct AIBinder;
+struct AParcel;
+struct AIBinder_Class;
+typedef int32_t binder_status_t;
+typedef uint32_t transaction_code_t;
+typedef void* (*fn_onCreate)(void*);
+typedef void (*fn_onDestroy)(void*);
+typedef binder_status_t (*fn_onTransact)(AIBinder*, transaction_code_t, const AParcel*, AParcel*);
+typedef bool (*fn_byteArrayAllocator)(void* ctx, int numElements, int8_t** out);
 
-// IBluetoothHci 方法码 = FIRST_CALL_TRANSACTION(1) + 声明顺序
-// 1 initialize 2 enable 3 disable 4 close 5 sendHciCommand 6 sendAclData 7 sendScoData
-// IBluetoothHciCallbacks：1 transportReset 2 hciEvent 3 aclDataReceived 4 scoDataReceived
-//                        5 latencyInformationChanged 6 flowStatus
-enum : uint32_t {
-  kInitialize = 1,
-  kEnable = 2,
-  kDisable = 3,
-  kClose = 4,
-  kSendCommand = 5,
-  kSendAcl = 6,
-  kSendSco = 7,
-};
+static void log(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 
-// HAL 约定：vec<uint8_t> 含 H4 类型字节（Fluoride 的实现如此）。若实测不对，--no-type-byte 翻一下。
+static constexpr uint32_t FLAG_ONEWAY = 1;
+static constexpr binder_status_t ST_OK = 0;
+
+static struct {
+  const AIBinder_Class* (*Class_define)(const char*, fn_onCreate, fn_onDestroy, fn_onTransact);
+  AIBinder* (*New)(const AIBinder_Class*, void*);
+  void (*IncStrong)(AIBinder*);
+  void (*DecStrong)(AIBinder*);
+  binder_status_t (*Prepare)(AIBinder*, AParcel**);
+  binder_status_t (*Transact)(AIBinder*, transaction_code_t, AParcel**, AParcel**, uint32_t);
+  AIBinder* (*SM_getService)(const char*);
+  AIBinder* (*SM_waitForService)(const char*);
+  binder_status_t (*Parcel_writeInt32)(AParcel*, int32_t);
+  binder_status_t (*Parcel_readInt32)(const AParcel*, int32_t*);
+  binder_status_t (*Parcel_writeByteArray)(AParcel*, const int8_t*, size_t);
+  binder_status_t (*Parcel_readByteArray)(const AParcel*, void*, fn_byteArrayAllocator);
+  binder_status_t (*Parcel_writeStrongBinder)(AParcel*, AIBinder*);
+  void (*Parcel_setDataPosition)(const AParcel*, int32_t);
+  void (*Parcel_delete)(AParcel*);
+  void (*Proc_setThreadPoolMaxThreadCount)(uint32_t);
+  void (*Proc_startThreadPool)(void);
+  void (*ForceDowngradeToVendorStability)(AIBinder*);  // platform-only，可能没有
+} ndk{};
+
+static bool loadNdk() {
+  void* h = dlopen("libbinder_ndk.so", RTLD_NOW | RTLD_GLOBAL);
+  if (!h) {
+    log("dlopen libbinder_ndk.so 失败: %s", dlerror());
+    return false;
+  }
+  auto get = [&](const char* n) { return dlsym(h, n); };
+  ndk.Class_define = (decltype(ndk.Class_define))get("AIBinder_Class_define");
+  ndk.New = (decltype(ndk.New))get("AIBinder_new");
+  ndk.IncStrong = (decltype(ndk.IncStrong))get("AIBinder_incStrong");
+  ndk.DecStrong = (decltype(ndk.DecStrong))get("AIBinder_decStrong");
+  ndk.Prepare = (decltype(ndk.Prepare))get("AIBinder_prepareTransaction");
+  ndk.Transact = (decltype(ndk.Transact))get("AIBinder_transact");
+  ndk.SM_getService = (decltype(ndk.SM_getService))get("AServiceManager_getService");
+  ndk.SM_waitForService = (decltype(ndk.SM_waitForService))get("AServiceManager_waitForService");
+  ndk.Parcel_writeInt32 = (decltype(ndk.Parcel_writeInt32))get("AParcel_writeInt32");
+  ndk.Parcel_readInt32 = (decltype(ndk.Parcel_readInt32))get("AParcel_readInt32");
+  ndk.Parcel_writeByteArray = (decltype(ndk.Parcel_writeByteArray))get("AParcel_writeByteArray");
+  ndk.Parcel_readByteArray = (decltype(ndk.Parcel_readByteArray))get("AParcel_readByteArray");
+  ndk.Parcel_writeStrongBinder = (decltype(ndk.Parcel_writeStrongBinder))get("AParcel_writeStrongBinder");
+  ndk.Parcel_setDataPosition = (decltype(ndk.Parcel_setDataPosition))get("AParcel_setDataPosition");
+  ndk.Parcel_delete = (decltype(ndk.Parcel_delete))get("AParcel_delete");
+  ndk.Proc_setThreadPoolMaxThreadCount =
+      (decltype(ndk.Proc_setThreadPoolMaxThreadCount))get("ABinderProcess_setThreadPoolMaxThreadCount");
+  ndk.Proc_startThreadPool = (decltype(ndk.Proc_startThreadPool))get("ABinderProcess_startThreadPool");
+  ndk.ForceDowngradeToVendorStability =
+      (decltype(ndk.ForceDowngradeToVendorStability))get("AIBinder_forceDowngradeToVendorStability");
+
+  const char* missing = nullptr;
+  if (!ndk.Class_define) missing = "AIBinder_Class_define";
+  else if (!ndk.New) missing = "AIBinder_new";
+  else if (!ndk.Prepare) missing = "AIBinder_prepareTransaction";
+  else if (!ndk.Transact) missing = "AIBinder_transact";
+  else if (!ndk.SM_getService) missing = "AServiceManager_getService";
+  else if (!ndk.Parcel_writeByteArray) missing = "AParcel_writeByteArray";
+  else if (!ndk.Parcel_readByteArray) missing = "AParcel_readByteArray";
+  else if (!ndk.Parcel_writeStrongBinder) missing = "AParcel_writeStrongBinder";
+  else if (!ndk.Proc_startThreadPool) missing = "ABinderProcess_startThreadPool";
+  if (missing) {
+    log("✗ libbinder_ndk 里缺 %s", missing);
+    return false;
+  }
+  return true;
+}
+
+// ------------------------------------------------------------ 本程序状态
+static const char* kSvcHci = "android.hardware.bluetooth.IBluetoothHci/default";
+static const char* kDescCallbacks = "android.hardware.bluetooth.IBluetoothHciCallbacks";
+
+// IBluetoothHci 方法码 = 声明顺序（1 initialize 2 enable 3 disable 4 close
+// 5 sendHciCommand 6 sendAclData 7 sendScoData）
+enum : uint32_t { kInitialize = 1, kEnable = 2, kDisable = 3, kClose = 4, kSendCommand = 5, kSendAcl = 6, kSendSco = 7 };
+// 回调方法码（1 transportReset 2 hciEvent 3 aclDataReceived 4 scoDataReceived 6 flowStatus）
+enum : uint32_t { kCbTransportReset = 1, kCbHciEvent = 2, kCbAcl = 3, kCbSco = 4, kCbFlowStatus = 6 };
+
+// HAL 约定：vec<uint8_t> 含 H4 类型字节（Fluoride 的实现如此）。不对就 --no-type-byte 翻一下。
 static bool g_include_type = true;
 static int g_mfd = -1;  // pty master
 static int g_sfd = -1;  // pty slave（挂了 N_HCI）
-static std::atomic<bool> g_run{true};
-static std::mutex g_ptx;  // 串行化 pty 写（回调可能跑在多个 binder 线程上）
+static volatile sig_atomic_t g_run = 1;
+static std::mutex g_ptx;  // 回调可能在多个 binder 线程上 → 串行化 pty 写
 static AIBinder* g_hal = nullptr;
 
 static void log(const char* fmt, ...) {
@@ -110,123 +168,12 @@ static void log(const char* fmt, ...) {
   vfprintf(stderr, fmt, ap);
   va_end(ap);
   fprintf(stderr, "\n");
+  fflush(stderr);
 }
 
-static void on_term(int) { g_run = false; }
+static void on_term(int) { g_run = 0; }
 
-// ---------------------------------------------------------------- 回调 binder
-static void* cbCreate(void*) { return new std::atomic<uint64_t>{0}; }
-static void cbDestroy(void* cookie) { delete static_cast<std::atomic<uint64_t>*>(cookie); }
-
-static bool looksLikeH4Type(uint8_t b) { return b == 0x02 || b == 0x03 || b == 0x04; }
-
-// NDK 的 AParcel_readByteArray(parcel, context, allocator)：由我们提供缓冲
-struct HciBuf {
-  int8_t data[2048];
-  size_t n = 0;
-};
-static bool allocHci(void* ctx, int numElements, int8_t** out) {
-  auto* b = static_cast<HciBuf*>(ctx);
-  b->n = 0;
-  if (numElements <= 0) {
-    *out = nullptr;
-    return true;
-  }
-  if (static_cast<size_t>(numElements) > sizeof(b->data)) return false;
-  *out = b->data;
-  b->n = static_cast<size_t>(numElements);
-  return true;
-}
-
-// 把 HAL 给的 HCI 包写进 pty，交给内核蓝牙栈
-static void toKernel(uint8_t h4type, const int8_t* data, size_t n) {
-  if (n == 0 || g_mfd < 0) return;
-  uint8_t frame[2048];
-  size_t flen = 0;
-  if (looksLikeH4Type(static_cast<uint8_t>(data[0]))) {
-    flen = n < sizeof(frame) ? n : sizeof(frame);
-    memcpy(frame, data, flen);
-  } else {
-    frame[0] = h4type;
-    flen = (n + 1 < sizeof(frame)) ? n + 1 : sizeof(frame);
-    memcpy(frame + 1, data, flen - 1);
-  }
-  std::lock_guard<std::mutex> lk(g_ptx);
-  ssize_t w = write(g_mfd, frame, flen);
-  if (w < 0) log("写 pty 失败: %s", strerror(errno));
-}
-
-// 手写服务端不会自动 enforceInterface，得自己跳过 token：
-// 线格式 = int32(strict-mode) + int32(字符数) + UTF-16 + 0x0000，再补到 4 字节
-static void skipToken(const AParcel* in) {
-  int32_t v = 0;
-  if (AParcel_readInt32(in, &v) != STATUS_OK) return;
-  int32_t len = -1;
-  if (AParcel_readInt32(in, &len) != STATUS_OK) return;
-  if (len <= 0) return;
-  size_t pos = 8 + static_cast<size_t>(len) * 2 + 2;
-  pos = (pos + 3) & ~static_cast<size_t>(3);
-  AParcel_setDataPosition(in, static_cast<int32_t>(pos));
-}
-
-static binder_status_t cbOnTransact(AIBinder*, uint32_t code, const AParcel* in, AParcel* out) {
-  HciBuf hb;
-  binder_status_t st = STATUS_OK;
-  skipToken(in);
-  if (code == 2 || code == 3 || code == 4) {
-    binder_status_t r = AParcel_readByteArray(in, &hb, allocHci);
-    if (r != STATUS_OK) st = r;
-  }
-  if (out) AParcel_writeInt32(out, 0);  // EX_NONE
-  switch (code) {
-    case 1:
-      log("← transportReset");
-      break;
-    case 2:
-      toKernel(0x04, hb.data, hb.n);  // hciEvent
-      break;
-    case 3:
-      toKernel(0x02, hb.data, hb.n);  // aclDataReceived
-      break;
-    case 4:
-      toKernel(0x03, hb.data, hb.n);  // scoDataReceived
-      break;
-    case 6:
-      break;  // flowStatus：H4 无流控语义，忽略
-    default:
-      log("← 未处理回调 code=%u", code);
-      break;
-  }
-  return st;
-}
-
-static const AIBinder_Class* g_cbClass = nullptr;
-
-// ---------------------------------------------------------------- binder 侧
-// 一次调用：prepareTransaction 让平台写 token/header，我们只 append 参数
-static binder_status_t callVoid(uint32_t code) {
-  AParcel* in = nullptr;
-  binder_status_t st = AIBinder_prepareTransaction(g_hal, &in);
-  if (st != STATUS_OK) return st;
-  AParcel* out = nullptr;
-  st = AIBinder_transact(g_hal, code, &in, &out, 0 /*sync*/);
-  if (out) AParcel_delete(out);
-  return st;
-}
-
-static binder_status_t callBytes(uint32_t code, const uint8_t* d, size_t n, bool oneway) {
-  AParcel* in = nullptr;
-  binder_status_t st = AIBinder_prepareTransaction(g_hal, &in);
-  if (st != STATUS_OK) return st;
-  st = AParcel_writeByteArray(in, reinterpret_cast<const int8_t*>(d), n);
-  if (st != STATUS_OK) return st;
-  AParcel* out = nullptr;
-  st = AIBinder_transact(g_hal, code, &in, &out, oneway ? FLAG_ONEWAY : 0);
-  if (out) AParcel_delete(out);
-  return st;
-}
-
-// ---------------------------------------------------------------- 内核侧
+// ------------------------------------------------------------ 内核侧
 static bool attachHci() {
   int mfd = open("/dev/ptmx", O_RDWR | O_NOCTTY);
   if (mfd < 0) {
@@ -265,7 +212,7 @@ static bool attachHci() {
   return true;
 }
 
-// pty master → HAL：按 H4 帧切包后逐包转发（内核一次 write 就是一整包，仍做缓冲以防被拆）
+// pty master → HAL：按 H4 切帧后逐包转发
 static void pumpToHal() {
   static std::vector<uint8_t> acc;
   uint8_t tmp[4096];
@@ -275,33 +222,131 @@ static void pumpToHal() {
   size_t pos = 0;
   while (pos + 2 <= acc.size()) {
     uint8_t type = acc[pos];
-    size_t need = 0, tlen = 0;
-    if (type == 0x01 && pos + 4 <= acc.size()) {
-      tlen = acc[pos + 3];
-      need = 4 + tlen;
-    } else if (type == 0x02 && pos + 5 <= acc.size()) {
-      tlen = static_cast<size_t>(acc[pos + 3] | (acc[pos + 4] << 8));
-      need = 5 + tlen;
-    } else if (type == 0x03 && pos + 6 <= acc.size()) {
-      tlen = acc[pos + 5];
-      need = 6 + tlen;
-    } else if (type > 0x03) {
+    size_t need = 0;
+    if (type == 0x01 && pos + 4 <= acc.size())
+      need = 4 + acc[pos + 3];
+    else if (type == 0x02 && pos + 5 <= acc.size())
+      need = 5 + static_cast<size_t>(acc[pos + 3] | (acc[pos + 4] << 8));
+    else if (type == 0x03 && pos + 6 <= acc.size())
+      need = 6 + acc[pos + 5];
+    else if (type > 0x03) {
       log("未知 H4 类型 0x%02x，丢 1 字节", type);
       ++pos;
       continue;
     } else {
-      break;  // 头还没收全
+      break;
     }
     if (pos + need > acc.size()) break;
     const uint8_t* pkt = acc.data() + pos;
     size_t flen = need;
     uint32_t code = type == 0x01 ? kSendCommand : type == 0x02 ? kSendAcl : kSendSco;
-    binder_status_t st =
-        callBytes(code, g_include_type ? pkt : pkt + 1, g_include_type ? flen : flen - 1, true);
-    if (st != STATUS_OK) log("→ HAL code=%u st=%d", code, st);
+    AParcel* in = nullptr;
+    if (ndk.Prepare(g_hal, &in) == ST_OK) {
+      const uint8_t* payload = g_include_type ? pkt : pkt + 1;
+      size_t n = g_include_type ? flen : flen - 1;
+      binder_status_t st = ndk.Parcel_writeByteArray(in, reinterpret_cast<const int8_t*>(payload), n);
+      if (st == ST_OK) {
+        AParcel* out = nullptr;
+        st = ndk.Transact(g_hal, code, &in, &out, FLAG_ONEWAY);
+        if (out) ndk.Parcel_delete(out);
+      }
+      if (st != ST_OK) log("→ HAL code=%u st=%d", code, st);
+    }
     pos += need;
   }
   acc.erase(acc.begin(), acc.begin() + pos);
+}
+
+// ------------------------------------------------------------ HAL → 内核
+static bool looksLikeH4Type(uint8_t b) { return b == 0x02 || b == 0x03 || b == 0x04; }
+
+struct HciBuf {
+  int8_t data[2048];
+  size_t n = 0;
+};
+
+static bool allocHci(void* ctx, int numElements, int8_t** out) {
+  auto* b = static_cast<HciBuf*>(ctx);
+  b->n = 0;
+  *out = nullptr;
+  if (numElements <= 0) return true;
+  if (static_cast<size_t>(numElements) > sizeof(b->data)) return false;
+  *out = b->data;
+  b->n = static_cast<size_t>(numElements);
+  return true;
+}
+
+static void toKernel(uint8_t h4type, const int8_t* data, size_t n) {
+  if (n == 0 || g_mfd < 0) return;
+  uint8_t frame[2048];
+  size_t flen = 0;
+  if (looksLikeH4Type(static_cast<uint8_t>(data[0]))) {
+    flen = n < sizeof(frame) ? n : sizeof(frame);
+    memcpy(frame, data, flen);
+  } else {
+    frame[0] = h4type;
+    flen = (n + 1 < sizeof(frame)) ? n + 1 : sizeof(frame);
+    memcpy(frame + 1, data, flen - 1);
+  }
+  std::lock_guard<std::mutex> lk(g_ptx);
+  if (write(g_mfd, frame, flen) < 0) log("写 pty 失败: %s", strerror(errno));
+}
+
+// 手写服务端不会自动 enforceInterface，得自己跳过 token：
+// 线格式 = int32(strict-mode) + int32(字符数) + UTF-16 + 0x0000，再补到 4 字节
+static void skipToken(const AParcel* in) {
+  if (!ndk.Parcel_readInt32 || !ndk.Parcel_setDataPosition) return;
+  int32_t v = 0;
+  if (ndk.Parcel_readInt32(in, &v) != ST_OK) return;
+  int32_t len = -1;
+  if (ndk.Parcel_readInt32(in, &len) != ST_OK) return;
+  if (len <= 0) return;
+  size_t pos = 8 + static_cast<size_t>(len) * 2 + 2;
+  pos = (pos + 3) & ~static_cast<size_t>(3);
+  ndk.Parcel_setDataPosition(in, static_cast<int32_t>(pos));
+}
+
+static void* cbCreate(void*) { return new int(0); }
+static void cbDestroy(void* cookie) { delete static_cast<int*>(cookie); }
+
+static binder_status_t cbOnTransact(AIBinder*, transaction_code_t code, const AParcel* in, AParcel* out) {
+  HciBuf hb;
+  skipToken(in);
+  if (code == kCbHciEvent || code == kCbAcl || code == kCbSco) {
+    binder_status_t r = ndk.Parcel_readByteArray(in, &hb, allocHci);
+    if (r != ST_OK) log("← 读 byte[] 失败 code=%u st=%d", code, r);
+  }
+  if (out && ndk.Parcel_writeInt32) ndk.Parcel_writeInt32(out, 0);  // EX_NONE
+  switch (code) {
+    case kCbTransportReset:
+      log("← transportReset");
+      break;
+    case kCbHciEvent:
+      toKernel(0x04, hb.data, hb.n);
+      break;
+    case kCbAcl:
+      toKernel(0x02, hb.data, hb.n);
+      break;
+    case kCbSco:
+      toKernel(0x03, hb.data, hb.n);
+      break;
+    case kCbFlowStatus:
+      break;  // H4 无流控语义
+    default:
+      log("← 未处理回调 code=%u", code);
+      break;
+  }
+  return ST_OK;
+}
+
+static binder_status_t callVoid(uint32_t code, bool oneway) {
+  AParcel* in = nullptr;
+  binder_status_t st = ndk.Prepare(g_hal, &in);
+  if (st != ST_OK) return st;
+  AParcel* out = nullptr;
+  st = ndk.Transact(g_hal, code, &in, &out, oneway ? FLAG_ONEWAY : 0);
+  if (out) ndk.Parcel_delete(out);
+  return st;
 }
 
 int main(int argc, char** argv) {
@@ -320,65 +365,61 @@ int main(int argc, char** argv) {
   signal(SIGTERM, on_term);
   signal(SIGPIPE, SIG_IGN);
 
-  // 1) binder 运行时：回调可能随时打进来，先起线程池
-  g_cbClass = AIBinder_Class_define(kDescCallbacks, cbCreate, cbDestroy, cbOnTransact);
-  if (!g_cbClass) {
+  if (!loadNdk()) return 1;
+
+  const AIBinder_Class* cls = ndk.Class_define(kDescCallbacks, cbCreate, cbDestroy, cbOnTransact);
+  if (!cls) {
     log("✗ AIBinder_Class_define 失败");
     return 1;
   }
-  AIBinder* cb = AIBinder_new(g_cbClass, nullptr);
+  AIBinder* cb = ndk.New(cls, nullptr);
   if (!cb) {
     log("✗ AIBinder_new 失败");
     return 1;
   }
-  // platform-only 符号：能 dlsym 到就强制 vendor-stable，拿不到就算了
-  // （多数 HAL 只检查 binder 是否 stable，不检查分区归属）
-  if (void* f = dlsym(RTLD_DEFAULT, "AIBinder_forceDowngradeToVendorStability"))
-    reinterpret_cast<void (*)(AIBinder*)>(f)(cb);
+  // vendor HAL 可能要求回调是 vendor-stable；有这个 platform 符号就用
+  if (ndk.ForceDowngradeToVendorStability) ndk.ForceDowngradeToVendorStability(cb);
 
-  ABinderProcess_setThreadPoolMaxThreadCount(2);
-  ABinderProcess_startThreadPool();
+  ndk.Proc_setThreadPoolMaxThreadCount(2);
+  ndk.Proc_startThreadPool();
 
-  g_hal = AServiceManager_getService(kSvcHci);
+  g_hal = ndk.SM_getService(kSvcHci);
+  if (!g_hal && ndk.SM_waitForService) g_hal = ndk.SM_waitForService(kSvcHci);
   if (!g_hal) {
     log("✗ 拿不到 %s —— HAL 活着吗？getprop init.svc.vendor.bluetooth-aidl-qti", kSvcHci);
     return 1;
   }
   log("✓ 拿到 %s", kSvcHci);
 
-  // 2) 内核侧 hci0
   if (!attachHci()) return 1;
 
-  // 3) 坐 HAL 的客户端位
+  // 坐 HAL 的客户端位
   {
     AParcel* in = nullptr;
-    binder_status_t st = AIBinder_prepareTransaction(g_hal, &in);
-    if (st == STATUS_OK) st = AParcel_writeStrongBinder(in, cb);
-    if (st == STATUS_OK) {
+    binder_status_t st = ndk.Prepare(g_hal, &in);
+    if (st == ST_OK) st = ndk.Parcel_writeStrongBinder(in, cb);
+    if (st == ST_OK) {
       AParcel* out = nullptr;
-      st = AIBinder_transact(g_hal, kInitialize, &in, &out, 0);
-      if (out) AParcel_delete(out);
+      st = ndk.Transact(g_hal, kInitialize, &in, &out, 0);
+      if (out) ndk.Parcel_delete(out);
     }
     log("initialize → %d", st);
-    st = callVoid(kEnable);
-    log("enable → %d", st);
+    log("enable → %d", callVoid(kEnable, false));
   }
 
-  // 4) 搬运主循环
   auto until = keep > 0 ? std::chrono::steady_clock::now() + std::chrono::seconds(keep)
                         : std::chrono::steady_clock::time_point::max();
   while (g_run && std::chrono::steady_clock::now() < until) {
-    pollfd pf{g_mfd, POLLIN, 0};
+    struct pollfd pf{g_mfd, POLLIN, 0};
     int s = poll(&pf, 1, 1000);
     if (s > 0 && (pf.revents & POLLIN)) pumpToHal();
     if (s < 0 && errno != EINTR) break;
   }
 
-  // 5) 体面退场：disable+close 把 HAL 交还给安卓 framework
-  log("退场：disable + close");
-  callVoid(kDisable);
-  callVoid(kClose);
-  AIBinder_decStrong(cb);
+  log("退场：disable + close（把 HAL 交还给安卓 framework）");
+  callVoid(kDisable, false);
+  callVoid(kClose, true);
+  if (ndk.DecStrong) ndk.DecStrong(cb);
   int back = N_TTY;
   ioctl(g_sfd, TIOCSETD, &back);
   close(g_sfd);
