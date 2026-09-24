@@ -395,6 +395,7 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 int main(int argc, char** argv) {
   int keep = 0;
   bool probe4 = false, probe5 = false, probeEnable = false;
+  int mapCode = 0;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
       probe4 = true;
@@ -402,6 +403,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[i], "--probe5")) {
       probe5 = true;
+      continue;
+    }
+    if (!strcmp(argv[i], "--map") && i + 1 < argc) {
+      mapCode = atoi(argv[++i]);
       continue;
     }
     if (!strcmp(argv[i], "--probe-enable")) {
@@ -517,6 +522,24 @@ int main(int argc, char** argv) {
   };
 
   int initialized = 0;
+  if (mapCode > 0) {
+    // 方法表实测：只 initialize（code 1 已验证正确），然后空参 oneway 发 mapCode，
+    // 由 HAL 自己的日志（BluetoothHci::xxx()）告诉我们它是哪个方法。
+    int32_t first = 0x7abc;
+    binder_status_t ist = callWith(kInitialize, true, 0, &first);
+    log("MAP code=%d initialize=%d", mapCode, ist);
+    if (ist == ST_OK) {
+      binder_status_t st = callWith((uint32_t)mapCode, false, FLAG_ONEWAY, nullptr);
+      log("MAP code=%d → 投递 st=%d（看 HAL 日志里的 BluetoothHci:: 行）", mapCode, st);
+    }
+    // 不发 close（会被误认成方法表的一行）；直接退场让 binder 死亡通知去清理
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    int back = N_TTY;
+    ioctl(g_sfd, TIOCSETD, &back);
+    close(g_sfd);
+    close(g_mfd);
+    return 0;
+  }
   if (probeEnable) {
     // initialize 必须已经成功才有意义
     int32_t first = 0x7abc;
