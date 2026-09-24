@@ -62,3 +62,7 @@ adb shell su -c '/data/local/tmp/bthci-bridge --keep 600'
 M0（binder 可达性）与 M1（零模块造出 hci0）已实测通过；M1b（bluedevil 认领 adapter）与
 M2（接真 HCI）待做。仅在小米平板 8 Pro（piano / 25091RP04C，HyperOS + KernelSU）上验证过，
 不保证适用于其它机型。
+
+## 许可
+
+MIT，见 [LICENSE](LICENSE)。构建产物只链接系统库 `libbinder_ndk` 与内核 UAPI 头，不引入 GPL 代码（与主项目 `droid-drm-takeover` 的 GPL-3.0 相互独立）。
