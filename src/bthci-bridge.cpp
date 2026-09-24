@@ -675,9 +675,14 @@ int main(int argc, char** argv) {
           }
         }
         std::this_thread::sleep_for(std::chrono::seconds(2));
-        log("S6 type=%d code=%-2u initA=%d fd=%d → 同步st=%d 回包首=%d event=%llu", it, code, ia, fd1,
-            st, first, (unsigned long long)g_cbEvents);
-        if (st == ST_OK && (first == 0 || g_cbEvents > 0)) {
+        log("S6 type=%d code=%-2u initA=%d fd=%d → 同步st=%d 回包首=%d event=%llu %s", it, code, ia, fd1,
+            st, first, (unsigned long long)g_cbEvents,
+            g_cbEvents > 0 ? "" : "(无副作用，不算命中)");
+        if (st != ST_OK && fd1 > 0 && code >= 3) {
+          // 顺带把"是不是 oneway 方法"的信号留下（-2147483647=对 oneway 方法发了同步调用）
+          log("     ↑ code=%u 的同步失败码可用于判断它是不是 oneway/要不要参数", code);
+        }
+        if (g_cbEvents > 0) {  // §18：EX_NONE 不算命中，只认副作用（芯片真回了 event）
           g_cmdCode = code;
           g_include_type = (it == 1);
           initialized = 1;
