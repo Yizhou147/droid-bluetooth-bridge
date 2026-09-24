@@ -97,6 +97,8 @@ static int kickHci(int up) {
 
 // 自动扫出来的 sendHciCommand / sendAclData 码位（初值是猜的）
 static uint32_t g_cmdCode = 5, g_aclCode = 6;
+static uint32_t g_enableCode = 4;
+static int g_enableArg = 1;
 
 // ------------------------------------------------------------ libbinder_ndk 的最小声明
 struct AIBinder;
@@ -468,7 +470,7 @@ int main(int argc, char** argv) {
       continue;
     }
     if (!strcmp(argv[i], "--search")) {
-      search = true;
+      search = true;  // --search 现在就是"单候选矩阵"
       continue;
     }
     if (!strcmp(argv[i], "--auto")) {
@@ -621,45 +623,60 @@ int main(int argc, char** argv) {
 
   int initialized = 0;
   if (search) {
-    // 二维搜：cmdCode 2..8 × 负载是否含 H4 类型字节。判据全部同时看：
-    // 收回>0（有 hciEvent）/ HALfd>0（enable 真生效）/ HALpid 变（HAL 被杀）/ rfkill 解除
-    bool found = false;
-    for (int it = 1; it >= 0 && !found; it--) {
-      for (uint32_t c = 2; c <= 8 && !found; c++) {
-        g_include_type = (it == 1);
-        g_cmdCode = c;
-        g_aclCode = c + 1;
-        g_toKernel = 0;
-        g_toHal = 0;
-        kickHci(0);
-        if (!acquire()) { log("SEARCH type=%d cmd=%u 占位失败", it, c); continue; }
-        int pid0 = halPid();
-        binder_status_t est = callWith(kEnable, false, FLAG_ONEWAY, nullptr, 1);
-        kickHci(1);
-        int waited = 0;
-        while (waited < 6 && g_toKernel == 0) {
-          std::this_thread::sleep_for(std::chrono::seconds(1));
-          struct pollfd pf{g_mfd, POLLIN, 0};
-          if (poll(&pf, 1, 100) > 0 && (pf.revents & POLLIN)) pumpToHal();
-          ++waited;
-        }
-        int fds = halTransportFds(), pid1 = halPid(), soft = rfSoft();
-        log("SEARCH type=%d cmd=%u en=%d → 转发=%llu 收回=%llu HALfd=%d pid %d→%d soft=%d %s", it, c,
-            est, (unsigned long long)g_toHal, (unsigned long long)g_toKernel, fds, pid0, pid1, soft,
-            g_toKernel > 0   ? "★★★ 芯片回应了"
-            : (fds > 0       ? "（enable 生效但无 event）"
-                             : "（enable 未生效）"));
-        if (g_toKernel > 0) { found = true; initialized = 1; break; }
-        kickHci(0);
+    // **一因一果**：一次 acquire 只发一个 enable 候选，判据只用 HAL 是否打开传输 fd
+    // （0→>0），轮询 7 秒（上电要 ~1s，§15 记录过一次误判）。不做 hciconfig down，
+    // 不靠任何日志行推断。
+    struct Cand { uint32_t code; int arg; };  // arg<0 = 无参
+    static const Cand cands[] = {{2, -1}, {2, 1}, {2, 0}, {3, -1}, {3, 1}, {3, 0},
+                                 {4, -1}, {4, 1}, {4, 0}};
+    int hit = -1;
+    for (size_t i = 0; i < sizeof(cands) / sizeof(cands[0]) && hit < 0; i++) {
+      if (!acquire()) { log("MATH %u/arg=%d 占位失败", cands[i].code, cands[i].arg); continue; }
+      binder_status_t est =
+          callWith(cands[i].code, false, FLAG_ONEWAY, nullptr, cands[i].arg);
+      int fds = 0;
+      for (int k = 0; k < 7; k++) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        fds = halTransportFds();
+        if (fds > 0) break;
       }
+      log("MATH code=%u arg=%-3d 投递=%d → HALfd=%d %s", cands[i].code, cands[i].arg, est, fds,
+          fds > 0 ? "★★★ enable 就是它" : "");
+      if (fds > 0) { hit = (int)cands[i].code; g_enableCode = cands[i].code; g_enableArg = cands[i].arg; }
     }
-    if (!found) { log("✗ SEARCH 全组合都没让芯片回应"); return 1; }
-    log("★ 定板：sendHciCommand=%u（负载%s类型字节），继续搬运 %d 秒", g_cmdCode,
-        g_include_type ? "含" : "不含", keep > 0 ? keep : 30);
-    auto until3 = std::chrono::steady_clock::now() + std::chrono::seconds(keep > 0 ? keep : 30);
-    while (g_run && std::chrono::steady_clock::now() < until3) {
+    if (hit < 0) { log("✗ 九个 enable 候选都没让 HAL 开传输"); return 1; }
+    log("★ enable 定板：code=%u arg=%d", g_enableCode, g_enableArg);
+    // 芯片已开火，紧接着让内核发第一帧，然后扫 sendHciCommand 的码位（判据=收回>0）
+    for (uint32_t c = 2; c <= 8; c++) {
+      g_cmdCode = c;
+      g_toKernel = 0;
+      kickHci(1);
+      int got = 0;
+      for (int k = 0; k < 5; k++) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        struct pollfd pf{g_mfd, POLLIN, 0};
+        if (poll(&pf, 1, 100) > 0 && (pf.revents & POLLIN)) pumpToHal();
+        if (g_toKernel > 0) { got = 1; break; }
+      }
+      log("CMD候选 code=%u → 收回=%llu %s", c, (unsigned long long)g_toKernel,
+          got ? "★★★ 芯片回应，sendHciCommand 就是它" : "");
+      if (got) { initialized = 1; break; }
+    }
+    if (!initialized) { log("✗ sendHciCommand 码位未定"); return 1; }
+    log("★ 两个码位都定了：enable=%u / sendHciCommand=%u，搬运 %d 秒", g_enableCode, g_cmdCode,
+        keep > 0 ? keep : 30);
+    auto until4 = std::chrono::steady_clock::now() + std::chrono::seconds(keep > 0 ? keep : 30);
+    while (g_run && std::chrono::steady_clock::now() < until4) {
       struct pollfd pf{g_mfd, POLLIN, 0};
-      if (poll(&pf, 1, 500) > 0 && (pf.revents & POLLIN)) pumpToHal();
+      if (poll(&pf, 1, 300) > 0 && (pf.revents & POLLIN)) pumpToHal();
+    }
+    {
+      char cmd[224];
+      snprintf(cmd, sizeof(cmd),
+               "P=$(ps -A -o PID,NAME | grep -w bluetoothd | head -1 | cut -d' ' -f1); "
+               "nsenter -t $P -m -p -- /usr/bin/hciconfig -a 2>/dev/null | head -4");
+      FILE* g = popen(cmd, "r");
+      if (g) { char ln[256]; while (fgets(ln, sizeof(ln), g)) fprintf(stderr, "[bthci] hciconfig| %s", ln); pclose(g); }
     }
     return 0;
   }
