@@ -454,7 +454,7 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
-  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false;
+  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false, search3 = false;
   int mapCode = 0;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
@@ -467,6 +467,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[i], "--map") && i + 1 < argc) {
       mapCode = atoi(argv[++i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "--search3")) {
+      search3 = true;
       continue;
     }
     if (!strcmp(argv[i], "--search2")) {
@@ -626,6 +630,34 @@ int main(int argc, char** argv) {
   };
 
   int initialized = 0;
+  if (search3) {
+    // 分类剩余码位：先用**同步无参**探它是不是 oneway / 要不要参数，
+    // 再用 **oneway 无参 + 轮询 HAL fd 10 秒**判它是不是 enable。
+    for (uint32_t code = 2; code <= 10; code++) {
+      if (!acquire()) { log("S3 code=%u 占位失败", code); continue; }
+      int32_t first = 0x7abc;
+      binder_status_t sst = callWith(code, false, 0, &first);       // 同步无参
+      if (sst != ST_OK) {
+        log("S3 code=%u 同步无参 st=%d（%s）", code, sst,
+            sst == -2147483647 ? "=oneway 方法" : (sst == -61 ? "=要数据(数组?)" : "其它"));
+      } else {
+        log("S3 code=%u 同步无参 st=%d 回包首int32=%d", code, sst, first);
+      }
+      if (!acquire()) continue;
+      binder_status_t ost = callWith(code, false, FLAG_ONEWAY, nullptr);
+      int fds = 0;
+      for (int k = 0; k < 10; k++) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        fds = halTransportFds();
+        if (fds > 0) break;
+      }
+      log("     code=%u oneway无参 投递=%d → HALfd=%d %s", code, ost, fds,
+          fds > 0 ? "★★★ 这就是 enable" : "");
+      if (fds > 0) { log("★ enable = code %u（oneway 无参）", code); return 0; }
+    }
+    log("✗ S3 2..10 里没有 oneway 无参能让 HAL 开传输");
+    return 1;
+  }
   if (search2) {
     // §16：矩阵漏掉的维度——之前全用 oneway 发，但服务端曾对我们标 oneway 的调用**回包**，
     // 说明这些方法是同步的。这轮一律**同步发送并读回包首 int32**：
