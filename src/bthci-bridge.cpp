@@ -188,14 +188,18 @@ static binder_status_t noopTransact(AIBinder*, transaction_code_t, const AParcel
 // 故本机的声明顺序是：initialize, close, enable(EnableReason), disable(DisableReason),
 //                      sendHciCommand, sendAclData, sendScoData
 enum : uint32_t {
+  // 蓝牙关闭的干净状态下 --sweep 实测：code=4 + int32 让 HAL 打开 bt_cp_ctrl/ttyHS
+  // （fd 0→2）⇒ enable = 4。code 2/3 全无副作用，说明本机 AIDL 顺序不是 AOSP 老的那套；
+  // disable / sendHciCommand / sendAclData 的真实码位待下一轮用
+  // 「发出去后 IBS 超时是否停止、有没有 hciEvent 回来」当判据再扫。
   kInitialize = 1,
-  kClose = 2,
-  kEnable = 3,
-  kDisable = 4,
-  kSendCommand = 5,
-  kSendAcl = 6,
-  kSendSco = 7,
+  kEnable = 4,
 };
+enum : uint32_t { kMaybeClose = 2, kMaybe3 = 3, kMaybeDisable = 5, kMaybeSendCmd = 6,
+                  kMaybeSendAcl = 7, kMaybeSendSco = 8 };
+// 过渡别名（这几位还是猜的，下一轮用副作用判据实定）：
+enum : uint32_t { kClose = kMaybeClose, kDisable = kMaybeDisable, kSendCommand = kMaybeSendCmd,
+                  kSendAcl = kMaybeSendAcl, kSendSco = kMaybeSendSco };
 // EnableReason / DisableReason 枚举值（AIDL）：0=OTHER/UNKNOWN，1/2/3 为其它原因；
 // 先按 0 发，不行再挨个试。
 // 实测 code=3 + int32 才会让 HAL 打开 bt_cp_ctrl/ttyHS；reason 具体取值待观察，
@@ -737,11 +741,10 @@ int main(int argc, char** argv) {
       {
         struct Try { uint32_t code; int arg; const char* label; };  // arg<0 = 不带参数
         static const Try tries[] = {
-            {3, -1, "code3/无参"},
-            {3, 1, "code3/int=1"},
-            {3, 0, "code3/int=0"},
-            {2, -1, "code2/无参"},
-            {2, 1, "code2/int=1"},
+            {4, 1, "code4/int=1"},
+            {4, 0, "code4/int=0"},
+            {4, 2, "code4/int=2"},
+            {4, 3, "code4/int=3"},
         };
         bool up = false;
         for (const auto& t : tries) {
