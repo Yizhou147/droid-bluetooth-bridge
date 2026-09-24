@@ -458,7 +458,7 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
-  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false, search3 = false, search4 = false, search5 = false, search6 = false, why = false;
+  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false, search3 = false, search4 = false, search5 = false, search6 = false, why = false, nameProbe = false;
   int mapCode = 0;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
@@ -471,6 +471,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[i], "--map") && i + 1 < argc) {
       mapCode = atoi(argv[++i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "--name")) {
+      nameProbe = true;
       continue;
     }
     if (!strcmp(argv[i], "--why")) {
@@ -650,6 +654,46 @@ int main(int argc, char** argv) {
   };
 
   int initialized = 0;
+  if (nameProbe) {
+    // §19 的正解：**用 HAL 自己的方法名日志做判据**（它很啰嗦，已经两次靠它破案），
+    // 而不是 binder 返回值。码 3..6 × {无参, byte[HCI_Reset], int32} × {同步, oneway}，
+    // 每次调用后立刻打印 HAL 最近的日志行 + HALfd + rfkill + 回调计数。
+    static const uint8_t rst[4] = {0x01, 0x03, 0x0C, 0x00};
+    static const char* shp[] = {"无参", "byte[]", "int32"};
+    for (uint32_t code = 3; code <= 6; code++) {
+      for (int sh = 0; sh < 3; sh++) {
+        for (int of = 0; of < 2; of++) {
+          if (!acquire()) { log("NAME code=%u %s %s 占位失败", code, shp[sh], of ? "oneway" : "sync"); continue; }
+          callWith(2, true, 0, nullptr);  // initialize_aidl：开 UART
+          g_cbEvents = 0;
+          AParcel* in = nullptr;
+          binder_status_t st = ndk.Prepare(g_hal, &in);
+          if (st == ST_OK && sh == 1) st = ndk.Parcel_writeByteArray(in, (const int8_t*)rst, sizeof(rst));
+          if (st == ST_OK && sh == 2) st = ndk.Parcel_writeInt32(in, 1);
+          AParcel* out = nullptr;
+          if (st == ST_OK) {
+            st = ndk.Transact(g_hal, code, &in, &out, of ? FLAG_ONEWAY : 0);
+            if (out) ndk.Parcel_delete(out);
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+          struct pollfd pf{g_mfd, POLLIN, 0};
+          if (poll(&pf, 1, 50) > 0 && (pf.revents & POLLIN)) pumpToHal();
+          log("NAME code=%u %-6s %-6s st=%d fd=%d soft=%d event=%llu", code, shp[sh],
+              of ? "oneway" : "sync  ", st, halTransportFds(), rfSoft(),
+              (unsigned long long)g_cbEvents);
+          FILE* g = popen("logcat -d -t 22 2>/dev/null | grep -E 'aidl_service|vendor.qti.bluetooth' | tail -4", "r");
+          if (g) {
+            char ln[512];
+            while (fgets(ln, sizeof(ln), g)) { size_t e = strlen(ln); while (e && (ln[e-1]=='\n')) ln[--e]=0; fprintf(stderr, "[bthci]  HAL| %s\n", ln); }
+            pclose(g);
+          }
+          if (g_cbEvents > 0) { log("★★★ code=%u %s %s 让芯片回了 event！", code, shp[sh], of?"oneway":"sync"); return 0; }
+        }
+      }
+    }
+    log("✗ NAME：码 3..6 的 24 种组合都没让芯片回 event（看上面 HAL 日志找它抱怨什么）");
+    return 1;
+  }
   if (why) {
     // 把回包整个读出来：int32 exceptionCode + int32 字符数 + UTF-16 文本。
     // AParcel 只给 typed 读接口，所以逐 int32 取，再把 int32 拆成两个 UTF-16 单元。
