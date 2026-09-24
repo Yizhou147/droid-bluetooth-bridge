@@ -452,7 +452,7 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
-  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false;
+  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false;
   int mapCode = 0;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
@@ -465,6 +465,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[i], "--map") && i + 1 < argc) {
       mapCode = atoi(argv[++i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "--search")) {
+      search = true;
       continue;
     }
     if (!strcmp(argv[i], "--auto")) {
@@ -616,6 +620,49 @@ int main(int argc, char** argv) {
   };
 
   int initialized = 0;
+  if (search) {
+    // 二维搜：cmdCode 2..8 × 负载是否含 H4 类型字节。判据全部同时看：
+    // 收回>0（有 hciEvent）/ HALfd>0（enable 真生效）/ HALpid 变（HAL 被杀）/ rfkill 解除
+    bool found = false;
+    for (int it = 1; it >= 0 && !found; it--) {
+      for (uint32_t c = 2; c <= 8 && !found; c++) {
+        g_include_type = (it == 1);
+        g_cmdCode = c;
+        g_aclCode = c + 1;
+        g_toKernel = 0;
+        g_toHal = 0;
+        kickHci(0);
+        if (!acquire()) { log("SEARCH type=%d cmd=%u 占位失败", it, c); continue; }
+        int pid0 = halPid();
+        binder_status_t est = callWith(kEnable, false, FLAG_ONEWAY, nullptr, 1);
+        kickHci(1);
+        int waited = 0;
+        while (waited < 6 && g_toKernel == 0) {
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+          struct pollfd pf{g_mfd, POLLIN, 0};
+          if (poll(&pf, 1, 100) > 0 && (pf.revents & POLLIN)) pumpToHal();
+          ++waited;
+        }
+        int fds = halTransportFds(), pid1 = halPid(), soft = rfSoft();
+        log("SEARCH type=%d cmd=%u en=%d → 转发=%llu 收回=%llu HALfd=%d pid %d→%d soft=%d %s", it, c,
+            est, (unsigned long long)g_toHal, (unsigned long long)g_toKernel, fds, pid0, pid1, soft,
+            g_toKernel > 0   ? "★★★ 芯片回应了"
+            : (fds > 0       ? "（enable 生效但无 event）"
+                             : "（enable 未生效）"));
+        if (g_toKernel > 0) { found = true; initialized = 1; break; }
+        kickHci(0);
+      }
+    }
+    if (!found) { log("✗ SEARCH 全组合都没让芯片回应"); return 1; }
+    log("★ 定板：sendHciCommand=%u（负载%s类型字节），继续搬运 %d 秒", g_cmdCode,
+        g_include_type ? "含" : "不含", keep > 0 ? keep : 30);
+    auto until3 = std::chrono::steady_clock::now() + std::chrono::seconds(keep > 0 ? keep : 30);
+    while (g_run && std::chrono::steady_clock::now() < until3) {
+      struct pollfd pf{g_mfd, POLLIN, 0};
+      if (poll(&pf, 1, 500) > 0 && (pf.revents & POLLIN)) pumpToHal();
+    }
+    return 0;
+  }
   if (autotune) {
     static const uint32_t cands[] = {5, 6, 7, 3, 8, 2};
     for (uint32_t c : cands) {
