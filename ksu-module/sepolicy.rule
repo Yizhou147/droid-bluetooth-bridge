@@ -1,6 +1,31 @@
-# 只加最小 allow。目标：我们的桥（KernelSU 的 ksu 域）能查/调 BtTpi 与蓝牙 HAL。
-allow ksu default_android_hwservice service_manager find
-allow ksu hal_bluetooth_default binder { call transfer }
-allow hal_bluetooth_default ksu binder { call transfer }
-allow ksu hal_bluetooth_service service_manager find
-allow ksu vendor_hal_bluetooth_service service_manager find
+# A 路线：让 KernelSU 的 su 域能 setcon/runcon 进 u:r:bluetooth:s0，
+# 进去之后用 service call 打 vendor.qti.hardware.bttpi.IBtTpi/default，
+# 验证它的 EX_SECURITY 是不是只查 SELinux 域。
+# 全部是 allow，没有 typepermissive、没有 setexec 之外的放宽；停用模块即回到原样。
+
+# 1) 允许 ksu → bluetooth 的域转换（runcon/setexeccon 需要）
+allow ksu bluetooth:process { transition dyntrans noatsecure siginh rlimitinh }
+allow bluetooth ksu:process dyntrans
+
+# 2) bluetooth 域里跑 shell 需要的最小权限（读 /system 可执行、读我们的脚本）
+allow bluetooth system_file:file { read open getattr map execute execute_no_trans }
+allow bluetooth shell_data_file:dir { search read open getattr }
+allow bluetooth shell_data_file:file { read open getattr map execute execute_no_trans }
+allow bluetooth labeledfs:filesystem getattr
+
+# 3) binder 通路（service call / 与蓝牙 HAL 同进程对话）
+allow bluetooth binder_device:chr_file { read write open ioctl getattr setattr }
+allow bluetooth binderfs:dir { search read open getattr }
+allow bluetooth binderfs:file { read write open ioctl getattr setattr }
+allow bluetooth servicemanager:binder { call transfer }
+allow bluetooth hwservicemanager:binder { call transfer }
+allow bluetooth default_android_service:service_manager find
+allow bluetooth hal_bluetooth_service:service_manager find
+allow bluetooth hwbinder_device:chr_file { read write open ioctl getattr setattr }
+
+# 4) 判据要看 dmesg/logcat、以及桥自己挂 pty 需要
+allow bluetooth self:capability { net_admin net_raw syslog }
+allow bluetooth proc:file { read open getattr }
+allow bluetooth devpts:chr_file { read write open ioctl getattr setattr }
+allow bluetooth tty_device:chr_file { read write open ioctl getattr setattr }
+allow bluetooth self:capability2 syslog
