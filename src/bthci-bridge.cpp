@@ -363,13 +363,15 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
+  bool probe4 = false;
   for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--probe4")) probe4 = true;
     if (!strcmp(argv[i], "--keep") && i + 1 < argc)
       keep = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--no-type-byte"))
       g_include_type = false;
     else {
-      fprintf(stderr, "用法: %s [--keep <秒>] [--no-type-byte]\n", argv[0]);
+      fprintf(stderr, "用法: %s [--keep <秒>] [--no-type-byte] [--probe4]\n", argv[0]);
       return 2;
     }
   }
@@ -415,42 +417,78 @@ int main(int argc, char** argv) {
 
   if (!attachHci()) return 1;
 
-  // 坐 HAL 的客户端位。实测 prepareTransaction(g_hal) 直接 -38(INVALID_OPERATION)：
-  // NDK 这层会拦"从 servicemanager 拿来的 vendor 稳定 binder"（C++ 的 service call 不受此限，
-  // 因为它走 BpBinder::transact）。两条绕法依次试：
-  //   Path A：用同 descriptor 的**本地** binder 当 parcel 工厂（Prepare 会写进正确的
-  //           interface token），再把 parcel 发给 vendor 句柄。
-  //   Path B：in=nullptr 直接 Transact（void 方法可能允许，NDK 内部会自建空 parcel）。
-  {
+  // ── 坐 HAL 的客户端位 ────────────────────────────────────────────────
+  // 实测：prepareTransaction(g_hal) 直接 -38(INVALID_OPERATION) —— NDK 这层会拦
+  // "从 servicemanager 拿来的 vendor 稳定 binder"（C++ 的 service call 不受此限，
+  // 它走 BpBinder::transact）。绕法 Path A：用同 descriptor 的**本地** binder 当
+  // parcel 工厂（Prepare 会写进正确的 interface token），再把 parcel 发给 vendor 句柄。
+  auto callWith = [&](uint32_t code, bool withCb, uint32_t flags, int32_t* firstReply) -> binder_status_t {
     AParcel* in = nullptr;
-    binder_status_t s1 = ndk.Prepare(hciLocal, &in);
-    binder_status_t s2 = (s1 == ST_OK) ? ndk.Parcel_writeStrongBinder(in, cb) : s1;
+    binder_status_t st = ndk.Prepare(hciLocal, &in);
+    if (st == ST_OK && withCb) st = ndk.Parcel_writeStrongBinder(in, cb);
     AParcel* out = nullptr;
-    binder_status_t s3 = (s2 == ST_OK) ? ndk.Transact(g_hal, kInitialize, &in, &out, 0) : s2;
-    if (out) ndk.Parcel_delete(out);
-    log("Path A initialize: prepare(local)=%d writeBinder=%d transact=%d", s1, s2, s3);
+    if (st == ST_OK) {
+      st = ndk.Transact(g_hal, code, &in, &out, flags);
+      if (out) {
+        if (firstReply && ndk.Parcel_readInt32 && ndk.Parcel_setDataPosition) {
+          ndk.Parcel_setDataPosition(out, 0);
+          ndk.Parcel_readInt32(out, firstReply);
+        }
+        ndk.Parcel_delete(out);
+      }
+    }
+    return st;
+  };
 
-    if (s3 != ST_OK) {
+  int initialized = 0;
+  if (probe4) {
+    struct Case { const char* name; uint32_t code; bool withCb; uint32_t flags; };
+    static const Case cases[] = {
+        {"enable/sync/无参", kEnable, false, 0},
+        {"enable/oneway/无参", kEnable, false, FLAG_ONEWAY},
+        {"initialize/sync/带回调", kInitialize, true, 0},
+        {"initialize/oneway/带回调", kInitialize, true, FLAG_ONEWAY},
+        {"initialize/sync/不带回调", kInitialize, false, 0},
+    };
+    for (const auto& c : cases) {
+      int32_t first = 0x7abc;
+      binder_status_t st = callWith(c.code, c.withCb, c.flags, &first);
+      log("PROBE %-26s code=%u flags=%u → st=%d 回包首int32=%d", c.name, c.code, c.flags, st, first);
+    }
+    initialized = 1;  // 探测模式不再走正式流程
+  } else {
+    int32_t first = 0x7abc;
+    binder_status_t st = callWith(kInitialize, true, 0, &first);
+    log("initialize(A/sync/带回调) → st=%d 回包首int32=%d", st, first);
+    if (st != ST_OK) {
+      st = callWith(kInitialize, true, FLAG_ONEWAY, &first);
+      log("initialize(A/oneway/带回调) → st=%d 回包首int32=%d", st, first);
+    }
+    if (st != ST_OK) {
       AParcel* in2 = nullptr;
       AParcel* out2 = nullptr;
-      binder_status_t s4 = ndk.Transact(g_hal, kInitialize, &in2, &out2, 0);
+      st = ndk.Transact(g_hal, kInitialize, &in2, &out2, 0);
       if (out2) ndk.Parcel_delete(out2);
-      log("Path B initialize(in=nullptr): transact=%d", s4);
-      if (s4 == ST_OK) s3 = s4;
+      log("initialize(B/in=nullptr) → st=%d", st);
     }
-
-    if (s3 != ST_OK) {
-      log("✗ initialize 两条路都不通，停在 -38/-ENOSYS 这一层");
+    if (st != ST_OK) {
+      log("✗ initialize 三种打法都不通");
     } else {
-      log("✓ initialize 通过");
-      // enable 同理：优先走本地工厂
-      AParcel* in = nullptr;
-      binder_status_t e1 = ndk.Prepare(hciLocal, &in);
-      AParcel* out = nullptr;
-      binder_status_t e2 = (e1 == ST_OK) ? ndk.Transact(g_hal, kEnable, &in, &out, 0) : e1;
-      if (out) ndk.Parcel_delete(out);
-      log("enable → %d", e2);
+      initialized = 1;
+      int32_t ef = 0x7abc;
+      log("enable → %d 回包首int32=%d", callWith(kEnable, false, 0, &ef), ef);
     }
+  }
+
+  if (!initialized) {
+    log("未拿到 HAL 客户端位，直接退场");
+    callVoid(kDisable, false);
+    callVoid(kClose, true);
+    int back = N_TTY;
+    ioctl(g_sfd, TIOCSETD, &back);
+    close(g_sfd);
+    close(g_mfd);
+    return 1;
   }
 
   auto until = keep > 0 ? std::chrono::steady_clock::now() + std::chrono::seconds(keep)
