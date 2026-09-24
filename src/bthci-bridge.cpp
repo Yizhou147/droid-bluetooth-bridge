@@ -79,6 +79,8 @@ static constexpr uint32_t FLAG_ONEWAY = 1;
 static constexpr binder_status_t ST_OK = 0;
 
 static struct {
+  void* handle;
+  void (*AssociateClass)(AIBinder*, const AIBinder_Class*);
   const AIBinder_Class* (*Class_define)(const char*, fn_onCreate, fn_onDestroy, fn_onTransact);
   AIBinder* (*New)(const AIBinder_Class*, void*);
   void (*IncStrong)(AIBinder*);
@@ -99,7 +101,8 @@ static struct {
   bool (*Binder_isRemote)(AIBinder*);
   bool (*Binder_isNative)(AIBinder*);
   int32_t (*Binder_getVendor)(AIBinder*);
-  void (*ForceDowngradeToVendorStability)(AIBinder*);  // platform-only，可能没有
+  void (*ForceDowngradeToVendorStability)(AIBinder*);  // platform 声明，但设备 .so 里有符号
+  void (*ForceDowngradeToSystemStability)(AIBinder*);
 } ndk{};
 
 static bool loadNdk() {
@@ -109,6 +112,8 @@ static bool loadNdk() {
     return false;
   }
   auto get = [&](const char* n) { return dlsym(h, n); };
+  ndk.handle = h;
+  ndk.AssociateClass = (decltype(ndk.AssociateClass))get("AIBinder_associateClass");
   ndk.Class_define = (decltype(ndk.Class_define))get("AIBinder_Class_define");
   ndk.New = (decltype(ndk.New))get("AIBinder_new");
   ndk.IncStrong = (decltype(ndk.IncStrong))get("AIBinder_incStrong");
@@ -132,9 +137,12 @@ static bool loadNdk() {
   ndk.Proc_startThreadPool = (decltype(ndk.Proc_startThreadPool))get("ABinderProcess_startThreadPool");
   ndk.ForceDowngradeToVendorStability =
       (decltype(ndk.ForceDowngradeToVendorStability))get("AIBinder_forceDowngradeToVendorStability");
+  ndk.ForceDowngradeToSystemStability =
+      (decltype(ndk.ForceDowngradeToSystemStability))get("AIBinder_forceDowngradeToSystemStability");
 
   const char* missing = nullptr;
   if (!ndk.Class_define) missing = "AIBinder_Class_define";
+  else if (!ndk.AssociateClass) missing = "AIBinder_associateClass";
   else if (!ndk.New) missing = "AIBinder_new";
   else if (!ndk.Prepare) missing = "AIBinder_prepareTransaction";
   else if (!ndk.Transact) missing = "AIBinder_transact";
@@ -427,6 +435,21 @@ int main(int argc, char** argv) {
     return 1;
   }
   log("✓ 拿到 %s", kSvcHci);
+  // 关键一步：AIBinder_prepareTransaction 的 interface token 是从 binder 绑定的 class
+  // (+0x48) 取的，而 AServiceManager_getService 返回的是没 class 的裸句柄 → 一律 -38。
+  // 用 AIBinder_associateClass 把我们 define 的 hciCls 挂上去。
+  if (ndk.AssociateClass && hciCls) {
+    ndk.AssociateClass(g_hal, hciCls);
+    log("✓ 已 associateClass（descriptor=%s）", kDescHci);
+  }
+  // vendor 稳定闸：先按 vendor 降级（本进程是 system 侧），拿不到符号再退 system
+  if (ndk.ForceDowngradeToVendorStability) {
+    ndk.ForceDowngradeToVendorStability(g_hal);
+    log("· HAL 句柄已降级为 vendor-stability");
+  } else if (ndk.ForceDowngradeToSystemStability) {
+    ndk.ForceDowngradeToSystemStability(g_hal);
+    log("· HAL 句柄已降级为 system-stability");
+  }
 
   if (!attachHci()) return 1;
 
@@ -437,7 +460,7 @@ int main(int argc, char** argv) {
   // parcel 工厂（Prepare 会写进正确的 interface token），再把 parcel 发给 vendor 句柄。
   auto callWith = [&](uint32_t code, bool withCb, uint32_t flags, int32_t* firstReply) -> binder_status_t {
     AParcel* in = nullptr;
-    binder_status_t st = ndk.Prepare(hciLocal, &in);
+    binder_status_t st = ndk.Prepare(g_hal, &in);
     if (st == ST_OK && withCb) st = ndk.Parcel_writeStrongBinder(in, cb);
     AParcel* out = nullptr;
     if (st == ST_OK) {
