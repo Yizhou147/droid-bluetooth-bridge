@@ -221,7 +221,8 @@ static binder_status_t noopTransact(AIBinder*, transaction_code_t, const AParcel
 }
 
 // ------------------------------------------------------------ 进程状态
-static bool g_include_type = true;  // HAL 侧 byte[] 是否含 H4 类型字节
+static bool g_include_type = true;   // 内核→HAL：byte[] 里带不带 H4 类型字节
+static bool g_cb_has_type = false;   // HAL→内核：回调 byte[] 里带不带 H4 类型字节
 static int g_mfd = -1;              // pty master
 static int g_sfd = -1;              // pty slave（挂了 N_HCI）
 static volatile sig_atomic_t g_run = 1;
@@ -294,13 +295,14 @@ static bool attachHci() {
   return true;
 }
 
-// HAL → 内核：补上 H4 类型字节写进 pty master
+// HAL → 内核：补上 H4 类型字节写进 pty master。
+// HAL 给的数组是否自带类型字节**不靠猜**（事件码 0x01~0x05 和类型字节取值范围重叠，
+// 首字节启发式一定会读错），用 --cb-with-type 显式切换，实测哪边通定哪边。
 static void toKernel(uint8_t h4type, const int8_t* data, size_t n) {
   if (n == 0 || g_mfd < 0) return;
   uint8_t frame[2048];
   size_t flen = 0;
-  // HAL 给的数组有可能自带类型字节（Fluoride 的实现如此）——首字节像类型就不重复加
-  if (data[0] <= 0x05) {
+  if (g_cb_has_type) {
     flen = n < sizeof(frame) ? n : sizeof(frame);
     memcpy(frame, data, flen);
   } else {
@@ -313,18 +315,34 @@ static void toKernel(uint8_t h4type, const int8_t* data, size_t n) {
   if (write(g_mfd, frame, flen) < 0) log("写 pty 失败: %s", strerror(errno));
 }
 
-// 手写服务端不会自动 enforceInterface，得自己跳过 token：
-// 线格式 = int32(strict-mode) + int32(字符数) + UTF-16 + 0x0000，再补到 4 字节
+// 手写服务端不会自动 enforceInterface，得自己跳过 token 才能读到参数。
+// 本机实测（dumpParcel 打出的 120 字节 initializationComplete）线格式：
+//   [0]=0x80000000 [1]=0xffffffff [2]='SYST'/'VNDR'(Android 15+ 的 tuning 头)
+//   [3]=descriptor 字符数(不含 NUL) 之后 UTF-16 + 0x0000，补到 4 字节 → 参数从这里开始
+// 前面那几个 flag 字到底是 2 个还是 3 个版本相关，所以不写死偏移：**扫**出那个
+// "后面紧跟 UTF-16 ASCII"的长度字，从它算参数起点。少算 4 字节会把参数读歪一位
+// （实测把 Status 读成 6422574 = UTF-16 的 "re"）。
 static void skipToken(const AParcel* in) {
-  if (!ndk.Parcel_readInt32 || !ndk.Parcel_setDataPosition) return;
-  int32_t v = 0;
-  if (ndk.Parcel_readInt32(in, &v) != ST_OK) return;
-  int32_t len = -1;
-  if (ndk.Parcel_readInt32(in, &len) != ST_OK) return;
-  if (len <= 0) return;
-  size_t pos = 8 + static_cast<size_t>(len) * 2 + 2;
-  pos = (pos + 3) & ~static_cast<size_t>(3);
-  ndk.Parcel_setDataPosition(in, static_cast<int32_t>(pos));
+  if (!ndk.Parcel_readInt32 || !ndk.Parcel_setDataPosition || !ndk.Parcel_getDataSize) return;
+  size_t sz = ndk.Parcel_getDataSize(in);
+  int words = static_cast<int>(sz / 4);
+  for (int i = 0; i + 1 < words; i++) {
+    ndk.Parcel_setDataPosition(in, i * 4);
+    int32_t len = 0;
+    if (ndk.Parcel_readInt32(in, &len) != ST_OK) return;
+    if (len < 8 || len > 120) continue;
+    int32_t w = 0;
+    if (ndk.Parcel_readInt32(in, &w) != ST_OK) return;
+    uint8_t b0 = w & 0xff, b1 = (w >> 8) & 0xff, b2 = (w >> 16) & 0xff, b3 = (w >> 24) & 0xff;
+    if (b1 != 0 || b3 != 0) continue;  // UTF-16LE 的 ASCII：奇数字节必须是 0
+    if (b0 < 0x20 || b0 > 0x7e || b2 < 0x20 || b2 > 0x7e) continue;
+    size_t str = (static_cast<size_t>(len) * 2 + 2 + 3) & ~static_cast<size_t>(3);
+    size_t pos = static_cast<size_t>(i + 1) * 4 + str;
+    if (pos <= sz) {
+      ndk.Parcel_setDataPosition(in, static_cast<int32_t>(pos));
+      return;
+    }
+  }
 }
 
 struct HciBuf {
@@ -376,8 +394,13 @@ static binder_status_t cbOnTransact(AIBinder*, transaction_code_t code, const AP
     if (ndk.Parcel_readInt32 && ndk.Parcel_readInt32(in, &st) == ST_OK) g_cbInitStatus = st;
     else g_cbInitStatus = 0;  // 读不到就当过（判据改看 HAL 是否开传输/是否回 event）
     ++g_cbInitSeen;
-    log("← initializationComplete(status=%d) %s", g_cbInitStatus,
-        g_cbInitStatus == 0 ? "★★★ HAL 认了我们这个客户端" : "（非 0 = HAL 拒绝，见 Status 枚举）");
+    // Status 枚举（AIDL IBluetoothHciCallbacks）：0=SUCCESS 1=HARDWARE_FAILURE
+    // 2=UNABLE_TO_INIT_ALGO 3=FIRMWARE_PATCH_NOT_SUPPORTED 4=UNKNOWN
+    static const char* sn[] = {"SUCCESS", "HARDWARE_FAILURE", "UNABLE_TO_INIT_ALGO",
+                               "FIRMWARE_PATCH_NOT_SUPPORTED", "UNKNOWN"};
+    log("← initializationComplete(status=%d %s)) %s", g_cbInitStatus,
+        (g_cbInitStatus >= 0 && g_cbInitStatus <= 4) ? sn[g_cbInitStatus] : "?",
+        g_cbInitStatus == 0 ? "★★★ HAL 认了我们这个客户端" : "");
     if (out && ndk.Parcel_writeInt32) ndk.Parcel_writeInt32(out, 0);
     return ST_OK;
   }
@@ -453,6 +476,25 @@ static int rfSoft() {
   if (fscanf(f, "%d", &v) != 1) v = -3;
   fclose(f);
   return v;
+}
+
+// HAL 自己很啰嗦，它抱怨的那一行往往就是答案（固件下载失败/IBS 超时/权限）。
+// 安卓 framework 死了 logd 照样在（class core），所以接管期也能读。
+static void dumpHalLog(int n) {
+  char cmd[224];
+  snprintf(cmd, sizeof(cmd),
+           "logcat -d -t %d 2>/dev/null | grep -iE 'bluetooth|btpower|ibs_|vendor.qti|bt_vendor|"
+           "hal_bluetooth' | tail -18",
+           n);
+  FILE* g = popen(cmd, "r");
+  if (!g) return;
+  char ln[512];
+  while (fgets(ln, sizeof(ln), g)) {
+    size_t e = strlen(ln);
+    while (e && (ln[e - 1] == '\n' || ln[e - 1] == '\r')) ln[--e] = 0;
+    fprintf(stderr, "[bthci]  HAL| %s\n", ln);
+  }
+  pclose(g);
 }
 
 // 一包发给 HAL。payload 是否含 H4 类型字节由 g_include_type 决定；
@@ -549,6 +591,8 @@ int main(int argc, char** argv) {
       keep = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--no-type-byte"))
       g_include_type = false;
+    else if (!strcmp(argv[i], "--cb-with-type"))
+      g_cb_has_type = true;
     else if (!strcmp(argv[i], "--no-kick"))
       kick = false;
     else if (!strcmp(argv[i], "--cmd") && i + 1 < argc) {
@@ -630,10 +674,13 @@ int main(int argc, char** argv) {
         halTransportFds(), rfSoft());
     if (g_cbInitSeen == 0) {
       log("✗ HAL 一个回调都没发 → 客户端位没坐上（查回调 binder 的稳定性/送达）");
+      dumpHalLog(120);
       goto out;
     }
-    if (g_cbInitStatus != 0)
-      log("· status=%d（非 0），但仍往下走：真判据是 HAL 开传输 + 芯片回 event", g_cbInitStatus);
+    if (g_cbInitStatus != 0) {
+      log("· status=%d（非 0）→ HAL 自己怎么说的：", g_cbInitStatus);
+      dumpHalLog(120);
+    }
   }
 
   if (cmdMode) {
@@ -654,6 +701,7 @@ int main(int argc, char** argv) {
     }
     log("结果：新收到 hciEvent=%llu %s", (unsigned long long)(g_cbEvents - before),
         g_cbEvents > before ? "★★★ binder↔芯片 链路通了" : "✗ 芯片没回 event");
+    dumpHalLog(80);
     rc = g_cbEvents > before ? 0 : 1;
     goto out;
   }
