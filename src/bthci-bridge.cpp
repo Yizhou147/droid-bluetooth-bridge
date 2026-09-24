@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include <dlfcn.h>
@@ -393,18 +394,41 @@ int main(int argc, char** argv) {
 
   if (!attachHci()) return 1;
 
-  // 坐 HAL 的客户端位
+  // 坐 HAL 的客户端位。
+  // -38 = libbinder 的 INVALID_OPERATION，来自 Stability::checkDeclared()：
+  // 从 system 进程拿 vendor 侧 AIDL HAL，必须先对句柄做 forceDowngrade，
+  // 否则 prepareTransaction 直接拒。三种降级依次试，谁通用谁。
   {
-    AParcel* in = nullptr;
-    binder_status_t st = ndk.Prepare(g_hal, &in);
-    if (st == ST_OK) st = ndk.Parcel_writeStrongBinder(in, cb);
-    if (st == ST_OK) {
-      AParcel* out = nullptr;
-      st = ndk.Transact(g_hal, kInitialize, &in, &out, 0);
-      if (out) ndk.Parcel_delete(out);
+    static const char* kDg[] = {"", "vendor", "system", "local"};
+    int okIdx = -1;
+    for (int i = 0; i < 4 && okIdx < 0; i++) {
+      if (i > 0) {
+        // 重新取句柄，避免上一次的 stability 标记残留
+        g_hal = ndk.SM_getService(kSvcHci);
+        if (!g_hal) { log("✗ 第%d次取句柄失败", i); break; }
+        void* sym = dlsym(RTLD_DEFAULT, (std::string("AIBinder_forceDowngradeTo") + kDg[i] + "Stability").c_str());
+        if (!sym) { log("  · 无 %s 符号，跳过", kDg[i]); continue; }
+        reinterpret_cast<void (*)(AIBinder*)>(sym)(g_hal);
+        log("  · 已对 HAL 句柄施加 %s-stability", kDg[i]);
+      }
+      AParcel* in = nullptr;
+      binder_status_t s1 = ndk.Prepare(g_hal, &in);
+      binder_status_t s2 = (s1 == ST_OK) ? ndk.Parcel_writeStrongBinder(in, cb) : s1;
+      binder_status_t s3 = (s2 == ST_OK) ? [&] {
+        AParcel* out = nullptr;
+        binder_status_t r = ndk.Transact(g_hal, kInitialize, &in, &out, 0);
+        if (out) ndk.Parcel_delete(out);
+        return r;
+      }() : s2;
+      log("initialize[%s]: prepare=%d writeBinder=%d transact=%d", kDg[i], s1, s2, s3);
+      if (s3 == ST_OK) okIdx = i;
     }
-    log("initialize → %d", st);
-    log("enable → %d", callVoid(kEnable, false));
+    if (okIdx < 0) {
+      log("✗ initialize 全部失败（-38=stability 未过 / -ENOSYS=事务码不对）");
+    } else {
+      log("✓ initialize 通过（stability=%s）", kDg[okIdx]);
+      log("enable → %d", callVoid(kEnable, false));
+    }
   }
 
   auto until = keep > 0 ? std::chrono::steady_clock::now() + std::chrono::seconds(keep)
