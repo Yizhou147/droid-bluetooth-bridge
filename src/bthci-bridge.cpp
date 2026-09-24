@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <ctime>
 #include <thread>
 
 #ifndef TIOCSETD
@@ -408,7 +409,7 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
-  bool probe4 = false, probe5 = false, probeEnable = false;
+  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false;
   int mapCode = 0;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
@@ -421,6 +422,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[i], "--map") && i + 1 < argc) {
       mapCode = atoi(argv[++i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "--sweep")) {
+      sweep = true;
       continue;
     }
     if (!strcmp(argv[i], "--probe-enable")) {
@@ -536,6 +541,56 @@ int main(int argc, char** argv) {
   };
 
   int initialized = 0;
+  if (sweep) {
+    // 让服务器自己报出每个事务码期望的参数形状：无参 / int32 / byte[] / binder
+    // 判据 = HAL 日志里那句 status（NOT_ENOUGH_DATA / BAD_TYPE / ReadAndValidateArraySize…）
+    //        加上"HAL 是否重新打开了 bt_cp_ctrl/ttyHS"（=真的执行了 enable）
+    int32_t first = 0x7abc;
+    log("SWEEP initialize=%d", callWith(kInitialize, true, 0, &first));
+    auto stamp = []() {
+      timespec ts{};
+      clock_gettime(CLOCK_REALTIME, &ts);
+      tm lt{};
+      localtime_r(&ts.tv_sec, &lt);
+      char buf[32];
+      snprintf(buf, sizeof(buf), "%02d:%02d:%02d.%03d", lt.tm_hour, lt.tm_min, lt.tm_sec,
+               (int)(ts.tv_nsec / 1000000));
+      return std::string(buf);
+    };
+    for (uint32_t code = 2; code <= 8; code++) {
+      for (int shape = 0; shape < 4; shape++) {
+        AParcel* in = nullptr;
+        binder_status_t st = ndk.Prepare(g_hal, &in);
+        if (st == ST_OK) {
+          if (shape == 1) st = ndk.Parcel_writeInt32(in, 1);
+          else if (shape == 2) {
+            const int8_t one[1] = {0};
+            st = ndk.Parcel_writeByteArray(in, one, 1);
+          } else if (shape == 3) st = ndk.Parcel_writeStrongBinder(in, cb);
+        }
+        AParcel* out = nullptr;
+        if (st == ST_OK) st = ndk.Transact(g_hal, code, &in, &out, FLAG_ONEWAY);
+        if (out) ndk.Parcel_delete(out);
+        static const char* sn[] = {"none", "int32", "byte[1]", "binder"};
+        log("SWEEP t=%s code=%u shape=%-7s 投递=%d", stamp().c_str(), code, sn[shape], st);
+        std::this_thread::sleep_for(std::chrono::milliseconds(350));
+        if (shape == 1 || shape == 2) {
+          char cmd[160];
+          snprintf(cmd, sizeof(cmd), "ls -l /proc/%d/fd 2>/dev/null | grep -cE 'bt_cp_ctrl|ttyHS'", halPid());
+          FILE* g = popen(cmd, "r");
+          int fds = -1;
+          if (g) { if (fscanf(g, "%d", &fds) != 1) fds = -2; pclose(g); }
+          if (fds > 0) log("   ★★★ code=%u shape=%s 让 HAL 打开了传输 fd=%d", code, sn[shape], fds);
+        }
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(1));
+    int back = N_TTY;
+    ioctl(g_sfd, TIOCSETD, &back);
+    close(g_sfd);
+    close(g_mfd);
+    return 0;
+  }
   if (mapCode > 0) {
     // 方法表实测：只 initialize（code 1 已验证正确），然后空参 oneway 发 mapCode，
     // 由 HAL 自己的日志（BluetoothHci::xxx()）告诉我们它是哪个方法。
