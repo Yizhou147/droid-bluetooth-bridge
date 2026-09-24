@@ -1,0 +1,6 @@
+# 只加最小 allow。目标：我们的桥（KernelSU 的 ksu 域）能查/调 BtTpi 与蓝牙 HAL。
+allow ksu default_android_hwservice service_manager find
+allow ksu hal_bluetooth_default binder { call transfer }
+allow hal_bluetooth_default ksu binder { call transfer }
+allow ksu hal_bluetooth_service service_manager find
+allow ksu vendor_hal_bluetooth_service service_manager find
