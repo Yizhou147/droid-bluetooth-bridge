@@ -19,31 +19,64 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
+      # 先看 runner 给了什么（上次失败就是因为盲目 sdkmanager 装固定版本号）
+      - name: 探测可用 NDK
+        run: |
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-<未设置>}"
+          echo "ANDROID_NDK_PATH=${ANDROID_NDK_PATH:-<未设置>}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-<未设置>}"
+          ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null || echo "预装目录里没有 ndk"
+          ls /usr/local/lib/android/sdk 2>/dev/null || true
 
-      - name: 安装 NDK r27
+      - name: 定位或安装 NDK
         run: |
           set -euo pipefail
-          export ANDROID_HOME="$PWD/android-sdk"
-          mkdir -p "$ANDROID_HOME/cmdline-tools"
-          curl -fsSL -o ct.zip \
-            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          unzip -q ct.zip -d "$ANDROID_HOME/cmdline-tools"
-          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;r27.2.12479018" "platform-tools"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          CC_REL="toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android33-clang++"
+          found=""
+          # 1) 预装的（GitHub runner 一直带 NDK，版本随镜像变）
+          for base in ${ANDROID_NDK_HOME:-} ${ANDROID_NDK_PATH:-} \
+                      "$HOME/android-sdk/ndk" "$HOME/Android/Sdk/ndk" \
+                      ${ANDROID_HOME:-/usr/local/lib/android/sdk}/ndk; do
+            [ -n "$base" ] || continue
+            if [ -x "$base/$CC_REL" ]; then found="$base"; break; fi
+            for c in "$base"/*; do
+              [ -x "$c/$CC_REL" ] && { found="$c"; break; }
+            done
+            [ -n "$found" ] && break
+          done
+          # 2) 没有就自己装一个确实存在的版本
+          if [ -z "$found" ]; then
+            command -v java >/dev/null || { echo "回落安装需要 Java，runner 上却没有" >&2; exit 1; }
+            export ANDROID_HOME="$PWD/android-sdk"
+            mkdir -p "$ANDROID_HOME/cmdline-tools"
+            curl -fsSL -o ct.zip \
+              https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+            unzip -q ct.zip -d "$ANDROID_HOME/cmdline-tools"
+            mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+            SM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+            yes | "$SM" --licenses >/dev/null 2>&1 || true
+            "$SM" --update >/dev/null 2>&1 || true
+            for pkg in "ndk;r27.2.12479018" "ndk;27.0.12077973" "ndk;26.3.11579264" "ndk;26.1.10909125" "ndk;25.2.9519653"; do
+              if "$SM" "$pkg" >/dev/null 2>&1; then
+                found="$ANDROID_HOME/ndk/${pkg#ndk;}"
+                echo "已安装 $pkg"
+                break
+              fi
+            done
+          fi
+          if [ -z "$found" ]; then
+            echo "拿不到任何可用 NDK" >&2
+            exit 1
+          fi
+          echo "使用 NDK：$found"
+          echo "ANDROID_NDK_HOME=$found" >> "$GITHUB_ENV"
 
       - name: 编译
         run: |
           set -euo pipefail
           sh build.sh
-          file out/bthci-bridge
           ls -l out/
+          head -c 20 out/bthci-bridge | od -c | head -2
 
       - uses: actions/upload-artifact@v4
         with:
