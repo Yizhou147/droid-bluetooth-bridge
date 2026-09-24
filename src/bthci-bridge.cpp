@@ -221,7 +221,10 @@ static binder_status_t noopTransact(AIBinder*, transaction_code_t, const AParcel
 }
 
 // ------------------------------------------------------------ 进程状态
-static bool g_include_type = true;   // 内核→HAL：byte[] 里带不带 H4 类型字节
+// 实测（09-24 23:1x，--cmd 011000 = HCI_Read_Local_Version 不带类型字节 → 芯片回 event；
+// 带类型字节的 01011000 不回）：QTI 这个 HAL 的 byte[] **不含 H4 类型字节**，两个方向都是。
+// 内核 hci_uart(H4) 那侧必须带类型字节，所以桥自己负责加/减。
+static bool g_include_type = false;  // 内核→HAL：写进 byte[] 的负载带不带 H4 类型字节
 static bool g_cb_has_type = false;   // HAL→内核：回调 byte[] 里带不带 H4 类型字节
 static int g_mfd = -1;              // pty master
 static int g_sfd = -1;              // pty slave（挂了 N_HCI）
@@ -322,27 +325,27 @@ static void toKernel(uint8_t h4type, const int8_t* data, size_t n) {
 // 前面那几个 flag 字到底是 2 个还是 3 个版本相关，所以不写死偏移：**扫**出那个
 // "后面紧跟 UTF-16 ASCII"的长度字，从它算参数起点。少算 4 字节会把参数读歪一位
 // （实测把 Status 读成 6422574 = UTF-16 的 "re"）。
-static void skipToken(const AParcel* in) {
-  if (!ndk.Parcel_readInt32 || !ndk.Parcel_setDataPosition || !ndk.Parcel_getDataSize) return;
+// **返回值 = 参数起点**，调用方必须自己 setDataPosition 回去再读：中途任何别的位置操作
+// （dumpParcel / 试错扫描）都会把游标挪走 —— 实测因此把 49 字节的 descriptor 当成事件数组读。
+static int32_t skipToken(const AParcel* in) {
+  if (!ndk.Parcel_readInt32 || !ndk.Parcel_setDataPosition || !ndk.Parcel_getDataSize) return 0;
   size_t sz = ndk.Parcel_getDataSize(in);
   int words = static_cast<int>(sz / 4);
   for (int i = 0; i + 1 < words; i++) {
     ndk.Parcel_setDataPosition(in, i * 4);
     int32_t len = 0;
-    if (ndk.Parcel_readInt32(in, &len) != ST_OK) return;
+    if (ndk.Parcel_readInt32(in, &len) != ST_OK) return 0;
     if (len < 8 || len > 120) continue;
     int32_t w = 0;
-    if (ndk.Parcel_readInt32(in, &w) != ST_OK) return;
+    if (ndk.Parcel_readInt32(in, &w) != ST_OK) return 0;
     uint8_t b0 = w & 0xff, b1 = (w >> 8) & 0xff, b2 = (w >> 16) & 0xff, b3 = (w >> 24) & 0xff;
     if (b1 != 0 || b3 != 0) continue;  // UTF-16LE 的 ASCII：奇数字节必须是 0
     if (b0 < 0x20 || b0 > 0x7e || b2 < 0x20 || b2 > 0x7e) continue;
     size_t str = (static_cast<size_t>(len) * 2 + 2 + 3) & ~static_cast<size_t>(3);
     size_t pos = static_cast<size_t>(i + 1) * 4 + str;
-    if (pos <= sz) {
-      ndk.Parcel_setDataPosition(in, static_cast<int32_t>(pos));
-      return;
-    }
+    if (pos <= sz) return static_cast<int32_t>(pos);
   }
+  return 0;
 }
 
 struct HciBuf {
@@ -387,35 +390,38 @@ static binder_status_t cbOnTransact(AIBinder*, transaction_code_t code, const AP
                                     AParcel* out) {
   ++g_cbAny;
   HciBuf hb;
-  skipToken(in);
+  // 参数起点只认 skipToken 的返回值，并且**每次读之前都显式 setDataPosition**：
+  // 中途任何别的位置操作（dumpParcel、试错扫描）都会把游标挪走。
+  const int32_t p0 = skipToken(in);
   if (code == kCbInitComplete) {
-    dumpParcel("initComplete", in);
-    int32_t st = -1;
-    if (ndk.Parcel_readInt32 && ndk.Parcel_readInt32(in, &st) == ST_OK) g_cbInitStatus = st;
-    else g_cbInitStatus = 0;  // 读不到就当过（判据改看 HAL 是否开传输/是否回 event）
+    int32_t st = 0;
+    binder_status_t r = ST_OK;
+    if (ndk.Parcel_setDataPosition && ndk.Parcel_readInt32) {
+      ndk.Parcel_setDataPosition(in, p0);
+      r = ndk.Parcel_readInt32(in, &st);
+    }
+    g_cbInitStatus = (r == ST_OK) ? st : -1;
     ++g_cbInitSeen;
     // Status 枚举（AIDL IBluetoothHciCallbacks）：0=SUCCESS 1=HARDWARE_FAILURE
     // 2=UNABLE_TO_INIT_ALGO 3=FIRMWARE_PATCH_NOT_SUPPORTED 4=UNKNOWN
     static const char* sn[] = {"SUCCESS", "HARDWARE_FAILURE", "UNABLE_TO_INIT_ALGO",
                                "FIRMWARE_PATCH_NOT_SUPPORTED", "UNKNOWN"};
-    log("← initializationComplete(status=%d %s)) %s", g_cbInitStatus,
-        (g_cbInitStatus >= 0 && g_cbInitStatus <= 4) ? sn[g_cbInitStatus] : "?",
+    log("← initializationComplete(status=%d %s)@%d %s", g_cbInitStatus,
+        (g_cbInitStatus >= 0 && g_cbInitStatus <= 4) ? sn[g_cbInitStatus] : "?", p0,
         g_cbInitStatus == 0 ? "★★★ HAL 认了我们这个客户端" : "");
+    dumpParcel("initComplete", in);
     if (out && ndk.Parcel_writeInt32) ndk.Parcel_writeInt32(out, 0);
     return ST_OK;
   }
   binder_status_t r = ST_OK;
   int rpos = -1;
-  for (int32_t pos = 0; pos <= 160; pos += 4) {
-    ndk.Parcel_setDataPosition(in, pos);
+  if (ndk.Parcel_setDataPosition && ndk.Parcel_readByteArray) {
+    ndk.Parcel_setDataPosition(in, p0);
     r = ndk.Parcel_readByteArray(in, &hb, allocHci);
-    if (r == ST_OK && hb.n > 0 && hb.n <= 1024) {
-      rpos = pos;
-      break;
-    }
+    if (r == ST_OK && hb.n > 0 && hb.n <= 1024) rpos = p0;
   }
   if (rpos < 0) {
-    log("← 读 byte[] 失败 code=%u st=%d", code, r);
+    log("← 按 token 终点(%d)读 byte[] 失败 code=%u st=%d → dump 出来看布局", p0, code, r);
     dumpParcel("byte[]?", in);
   }
   if (out && ndk.Parcel_writeInt32) ndk.Parcel_writeInt32(out, 0);  // EX_NONE
@@ -589,8 +595,8 @@ int main(int argc, char** argv) {
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--keep") && i + 1 < argc)
       keep = atoi(argv[++i]);
-    else if (!strcmp(argv[i], "--no-type-byte"))
-      g_include_type = false;
+    else if (!strcmp(argv[i], "--with-type-byte"))
+      g_include_type = true;
     else if (!strcmp(argv[i], "--cb-with-type"))
       g_cb_has_type = true;
     else if (!strcmp(argv[i], "--no-kick"))
@@ -609,9 +615,11 @@ int main(int argc, char** argv) {
       return 0;
     } else {
       fprintf(stderr,
-              "用法: %s [--keep <秒>] [--no-kick] [--no-type-byte] [--cmd <hex>] [--codes]\n"
+              "用法: %s [--keep <秒>] [--no-kick] [--with-type-byte] [--cb-with-type] "
+              "[--cmd <hex>] [--codes]\n"
               "  默认：注册 hci0 + initialize + 双向搬运（keep 秒）\n"
-              "  --cmd 01030c00：不经内核，直接用 sendHciCommand 发一条命令，只看回调\n",
+              "  --cmd 011000：不经内核，直接用 sendHciCommand 发一条命令（**不带** H4 类型字节），"
+              "只看回调\n",
               argv[0]);
       return 2;
     }
