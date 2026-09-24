@@ -365,7 +365,10 @@ int main(int argc, char** argv) {
   int keep = 0;
   bool probe4 = false;
   for (int i = 1; i < argc; i++) {
-    if (!strcmp(argv[i], "--probe4")) probe4 = true;
+    if (!strcmp(argv[i], "--probe4")) {
+      probe4 = true;
+      continue;
+    }
     if (!strcmp(argv[i], "--keep") && i + 1 < argc)
       keep = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--no-type-byte"))
