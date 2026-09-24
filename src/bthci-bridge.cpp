@@ -442,14 +442,9 @@ int main(int argc, char** argv) {
     ndk.AssociateClass(g_hal, hciCls);
     log("✓ 已 associateClass（descriptor=%s）", kDescHci);
   }
-  // vendor 稳定闸：先按 vendor 降级（本进程是 system 侧），拿不到符号再退 system
-  if (ndk.ForceDowngradeToVendorStability) {
-    ndk.ForceDowngradeToVendorStability(g_hal);
-    log("· HAL 句柄已降级为 vendor-stability");
-  } else if (ndk.ForceDowngradeToSystemStability) {
-    ndk.ForceDowngradeToSystemStability(g_hal);
-    log("· HAL 句柄已降级为 system-stability");
-  }
+  // 注意：forceDowngrade* 只能作用于**本地** binder（对远端调用会
+  // LOG_ALWAYS_FATAL("Can only downgrade local binder")，实测把进程直接打死）。
+  // 远端句柄的 stability 由 associateClass + 对端声明决定，这里不做任何降级。
 
   if (!attachHci()) return 1;
 
