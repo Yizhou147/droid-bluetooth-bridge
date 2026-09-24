@@ -1,0 +1,52 @@
+name: build-bthci-bridge
+
+permissions:
+  contents: read
+
+# 本机是 arm64 Linux 且没有 NDK（NDK 只发 x86_64 host），所以交叉编译放云端做。
+# 产物：out/bthci-bridge（aarch64 / Android 13+ / 链接 libbinder_ndk）
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/**"
+      - "build.sh"
+      - ".github/workflows/build.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: 安装 NDK r27
+        run: |
+          set -euo pipefail
+          export ANDROID_HOME="$PWD/android-sdk"
+          mkdir -p "$ANDROID_HOME/cmdline-tools"
+          curl -fsSL -o ct.zip \
+            https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q ct.zip -d "$ANDROID_HOME/cmdline-tools"
+          mv "$ANDROID_HOME/cmdline-tools/cmdline-tools" "$ANDROID_HOME/cmdline-tools/latest"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null 2>&1 || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;r27.2.12479018" "platform-tools"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: 编译
+        run: |
+          set -euo pipefail
+          sh build.sh
+          file out/bthci-bridge
+          ls -l out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bthci-bridge-aarch64
+          path: out/bthci-bridge
+          if-no-files-found: error
