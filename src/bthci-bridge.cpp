@@ -731,20 +731,33 @@ int main(int argc, char** argv) {
       log("✗ initialize 三种打法都不通（enable 未试）");
     } else {
       initialized = 1;
-      // enable = 实测 code 3 + int32(EnableReason)。oneway 的 st=0 只代表投递成功，
-      // 所以判据用副作用：HAL 是否打开 bt_cp_ctrl/ttyHS、rfkill0 是否解除阻塞。
+      // enable 的确切形状还没定死：sweep 里 fd=2 出现在 code3 无参之后、code3+int32 之前，
+      // 而正式流程带 int32 时始终没开传输 → 逐个候选试，判据=HAL 是否打开传输 fd /
+      // rfkill 是否解除阻塞（oneway 的投递 0 不代表执行）。
       {
+        struct Try { uint32_t code; int arg; const char* label; };  // arg<0 = 不带参数
+        static const Try tries[] = {
+            {3, -1, "code3/无参"},
+            {3, 1, "code3/int=1"},
+            {3, 0, "code3/int=0"},
+            {2, -1, "code2/无参"},
+            {2, 1, "code2/int=1"},
+        };
         bool up = false;
-        for (int32_t r : kEnableReasons) {
-          binder_status_t est = callWith(kEnable, false, FLAG_ONEWAY, nullptr, r);
-          std::this_thread::sleep_for(std::chrono::seconds(3));
-          int soft = rfSoft();
-          int fds = halTransportFds();
-          log("enable(reason=%d) 投递=%d → rfkill.soft=%d HAL传输fd=%d %s", r, est, soft, fds,
-              (soft == 0 || fds > 0) ? "★ HAL 已开传输/上电" : "");
-          if (soft == 0 || fds > 0) { up = true; break; }
+        for (const auto& t : tries) {
+          binder_status_t est = callWith(t.code, false, FLAG_ONEWAY, nullptr, t.arg);
+          for (int i = 0; i < 6 && !up; i++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            int soft = rfSoft(), fds = halTransportFds();
+            if (soft == 0 || fds > 0) {
+              log("★ %s 生效（投递=%d）→ rfkill.soft=%d HAL传输fd=%d", t.label, est, soft, fds);
+              up = true;
+            }
+          }
+          if (!up) log("  · %s 无反应（投递=%d）", t.label, est);
+          else break;
         }
-        if (!up) log("✗ enable(reason 1/0/2/3) 都没让 HAL 开传输");
+        if (!up) log("✗ 所有 enable 候选都没让 HAL 开传输");
       }
     }
   }
