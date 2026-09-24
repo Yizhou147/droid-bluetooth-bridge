@@ -29,3 +29,8 @@ allow bluetooth proc:file { read open getattr }
 allow bluetooth devpts:chr_file { read write open ioctl getattr setattr }
 allow bluetooth tty_device:chr_file { read write open ioctl getattr setattr }
 allow bluetooth self:capability2 syslog
+
+# 3.5) Android 15 内核：源进程带 NO_NEW_PRIVS 时，exec 域转换还要 process2 这两位
+#      （缺它们就是 runcon: exec xxx: Permission denied，v0.2 实测踩过）
+allow ksu bluetooth:process2 { nnp_transition nosuid_transition }
+allow bluetooth bluetooth:process2 { nnp_transition nosuid_transition }
