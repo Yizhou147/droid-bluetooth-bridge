@@ -120,6 +120,24 @@ static void cbDestroy(void* cookie) { delete static_cast<std::atomic<uint64_t>*>
 
 static bool looksLikeH4Type(uint8_t b) { return b == 0x02 || b == 0x03 || b == 0x04; }
 
+// NDK 的 AParcel_readByteArray(parcel, context, allocator)：由我们提供缓冲
+struct HciBuf {
+  int8_t data[2048];
+  size_t n = 0;
+};
+static bool allocHci(void* ctx, int numElements, int8_t** out) {
+  auto* b = static_cast<HciBuf*>(ctx);
+  b->n = 0;
+  if (numElements <= 0) {
+    *out = nullptr;
+    return true;
+  }
+  if (static_cast<size_t>(numElements) > sizeof(b->data)) return false;
+  *out = b->data;
+  b->n = static_cast<size_t>(numElements);
+  return true;
+}
+
 // 把 HAL 给的 HCI 包写进 pty，交给内核蓝牙栈
 static void toKernel(uint8_t h4type, const int8_t* data, size_t n) {
   if (n == 0 || g_mfd < 0) return;
@@ -138,17 +156,26 @@ static void toKernel(uint8_t h4type, const int8_t* data, size_t n) {
   if (w < 0) log("写 pty 失败: %s", strerror(errno));
 }
 
+// 手写服务端不会自动 enforceInterface，得自己跳过 token：
+// 线格式 = int32(strict-mode) + int32(字符数) + UTF-16 + 0x0000，再补到 4 字节
+static void skipToken(const AParcel* in) {
+  int32_t v = 0;
+  if (AParcel_readInt32(in, &v) != STATUS_OK) return;
+  int32_t len = -1;
+  if (AParcel_readInt32(in, &len) != STATUS_OK) return;
+  if (len <= 0) return;
+  size_t pos = 8 + static_cast<size_t>(len) * 2 + 2;
+  pos = (pos + 3) & ~static_cast<size_t>(3);
+  AParcel_setDataPosition(in, static_cast<int32_t>(pos));
+}
+
 static binder_status_t cbOnTransact(AIBinder*, uint32_t code, const AParcel* in, AParcel* out) {
-  int8_t buf[2048];
-  size_t maxn = code == 1 || code == 5 || code == 6 ? 0 : sizeof(buf);
-  binder_status_t st = OK;
-  if (maxn) {
-    // AIDL 生成代码在读参数前会 enforceInterface；我们只取 byte[]，忽略 descriptor
-    binder_status_t r = AParcel_readByteArray(in, buf, maxn);
-    if (r != STATUS_OK && r != STATUS_BAD_TYPE) st = r;
-  } else if (code == 6) {
-    int32_t credits = 0;
-    AParcel_readInt32(in, &credits);  // flowStatus(SCOType, int32)：第一个参数是 enum，跳过
+  HciBuf hb;
+  binder_status_t st = STATUS_OK;
+  skipToken(in);
+  if (code == 2 || code == 3 || code == 4) {
+    binder_status_t r = AParcel_readByteArray(in, &hb, allocHci);
+    if (r != STATUS_OK) st = r;
   }
   if (out) AParcel_writeInt32(out, 0);  // EX_NONE
   switch (code) {
@@ -156,13 +183,13 @@ static binder_status_t cbOnTransact(AIBinder*, uint32_t code, const AParcel* in,
       log("← transportReset");
       break;
     case 2:
-      toKernel(0x04, buf, maxn);  // hciEvent
+      toKernel(0x04, hb.data, hb.n);  // hciEvent
       break;
     case 3:
-      toKernel(0x02, buf, maxn);  // aclDataReceived
+      toKernel(0x02, hb.data, hb.n);  // aclDataReceived
       break;
     case 4:
-      toKernel(0x03, buf, maxn);  // scoDataReceived
+      toKernel(0x03, hb.data, hb.n);  // scoDataReceived
       break;
     case 6:
       break;  // flowStatus：H4 无流控语义，忽略
@@ -271,7 +298,7 @@ static void pumpToHal() {
     uint32_t code = type == 0x01 ? kSendCommand : type == 0x02 ? kSendAcl : kSendSco;
     binder_status_t st =
         callBytes(code, g_include_type ? pkt : pkt + 1, g_include_type ? flen : flen - 1, true);
-    if (st != STATUS_OK) log("→ HAL code=%u st=%d(%s)", code, st, AIBinder_statusToString(st).c_str());
+    if (st != STATUS_OK) log("→ HAL code=%u st=%d", code, st);
     pos += need;
   }
   acc.erase(acc.begin(), acc.begin() + pos);
@@ -304,8 +331,10 @@ int main(int argc, char** argv) {
     log("✗ AIBinder_new 失败");
     return 1;
   }
-  // vendor 服务通常要求回调是 vendor-stable；必要时强制降级
-  AIBinder_forceDowngradeToVendorStability(cb);
+  // platform-only 符号：能 dlsym 到就强制 vendor-stable，拿不到就算了
+  // （多数 HAL 只检查 binder 是否 stable，不检查分区归属）
+  if (void* f = dlsym(RTLD_DEFAULT, "AIBinder_forceDowngradeToVendorStability"))
+    reinterpret_cast<void (*)(AIBinder*)>(f)(cb);
 
   ABinderProcess_setThreadPoolMaxThreadCount(2);
   ABinderProcess_startThreadPool();
