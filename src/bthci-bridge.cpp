@@ -33,6 +33,7 @@
 #include <poll.h>
 #include <signal.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <termios.h>
 #include <unistd.h>
@@ -63,6 +64,30 @@
 #define HCIUARTGETDEVICE 0x800455CA  // _IOR('U', 202, int)
 #endif
 #define HCI_UART_H4 0
+
+// 自己触发内核打开 hci0（等价 hciconfig hci0 up）：enable 之后 HAL 做 IBS DeviceWakeUp，
+// 1~2s 等不到第一帧 HCI 就超时并被 SIGKILL（实测 pid 2198→17985），所以必须立刻让内核开口。
+#ifndef AF_BLUETOOTH
+#define AF_BLUETOOTH 31
+#endif
+#ifndef BTPROTO_HCI
+#define BTPROTO_HCI 1
+#endif
+#define HCIDEVUP_E 0x400448C9u    // _IOW('H', 201, int)
+#define HCIDEVDOWN_E 0x400448CAu  // _IOW('H', 202, int)
+
+static int kickHci(int up) {
+  int s = socket(AF_BLUETOOTH, SOCK_RAW, BTPROTO_HCI);
+  if (s < 0) return -errno;
+  int id = 0;
+  int r = ioctl(s, up ? HCIDEVUP_E : HCIDEVDOWN_E, &id);
+  int e = errno;
+  close(s);
+  return r < 0 ? -e : 0;
+}
+
+// 自动扫出来的 sendHciCommand / sendAclData 码位（初值是猜的）
+static uint32_t g_cmdCode = 5, g_aclCode = 6;
 
 // ------------------------------------------------------------ libbinder_ndk 的最小声明
 struct AIBinder;
@@ -296,7 +321,7 @@ static void pumpToHal() {
     const uint8_t* pkt = acc.data() + pos;
     size_t flen = need;
     ++g_toHal;
-    uint32_t code = type == 0x01 ? kSendCommand : type == 0x02 ? kSendAcl : kSendSco;
+    uint32_t code = type == 0x01 ? g_cmdCode : type == 0x02 ? g_aclCode : kSendSco;
     AParcel* in = nullptr;
     if (ndk.Prepare(g_hal, &in) == ST_OK) {
       const uint8_t* payload = g_include_type ? pkt : pkt + 1;
@@ -418,7 +443,7 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
-  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false;
+  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false;
   int mapCode = 0;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
@@ -431,6 +456,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[i], "--map") && i + 1 < argc) {
       mapCode = atoi(argv[++i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "--auto")) {
+      autotune = true;
       continue;
     }
     if (!strcmp(argv[i], "--sweep")) {
@@ -566,7 +595,65 @@ int main(int argc, char** argv) {
     return v;
   };
 
+  // 一次完整的占位尝试（HAL 被杀后要重来）
+  auto acquire = [&]() -> bool {
+    g_hal = ndk.SM_getService(kSvcHci);
+    if (!g_hal) { log("acquire: getService 失败"); return false; }
+    if (ndk.AssociateClass) ndk.AssociateClass(g_hal, hciCls);
+    int32_t f = 0x7abc;
+    binder_status_t st = callWith(kInitialize, true, 0, &f);
+    log("acquire: initialize=%d 回包首int32=%d", st, f);
+    return st == ST_OK;
+  };
+
   int initialized = 0;
+  if (autotune) {
+    static const uint32_t cands[] = {5, 6, 7, 3, 8, 2};
+    for (uint32_t c : cands) {
+      g_cmdCode = c;
+      g_aclCode = c + 1;
+      g_toKernel = 0;
+      g_toHal = 0;
+      kickHci(0);  // 先确保是 down 的，open 时内核才会重新发 HCI_Reset
+      if (!acquire()) { log("AUTO cmdCode=%u 占位失败，换下一个", c); continue; }
+      binder_status_t est = callWith(kEnable, false, FLAG_ONEWAY, nullptr, 1);
+      int kr = kickHci(1);
+      int got = 0;
+      for (int i = 0; i < 6; i++) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        struct pollfd pf{g_mfd, POLLIN, 0};
+        if (poll(&pf, 1, 50) > 0 && (pf.revents & POLLIN)) pumpToHal();
+        if (g_toKernel > 0) { got = 1; break; }
+      }
+      log("AUTO cmdCode=%u enable=%d kick=%d → 转发=%llu 收回=%llu %s", c, est, kr,
+          (unsigned long long)g_toHal, (unsigned long long)g_toKernel,
+          got ? "★★★ HAL 回应了：cmdCode 就是它" : "无回应");
+      if (got) { initialized = 1; break; }
+      kickHci(0);
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    if (!initialized) { log("✗ AUTO 没找到会让 HAL 回应的 cmdCode"); return 1; }
+    log("✓ 定板 sendHciCommand=%u sendAclData=%u，继续搬运 %d 秒供观察", g_cmdCode, g_aclCode, keep);
+    auto until2 = std::chrono::steady_clock::now() + std::chrono::seconds(keep > 0 ? keep : 30);
+    while (g_run && std::chrono::steady_clock::now() < until2) {
+      struct pollfd pf{g_mfd, POLLIN, 0};
+      int s2 = poll(&pf, 1, 500);
+      if (s2 > 0 && (pf.revents & POLLIN)) pumpToHal();
+    }
+    {
+      char cmd[160];
+      snprintf(cmd, sizeof(cmd),
+               "nsenter -t $(ps -A -o PID,NAME | grep -w bluetoothd | head -1 | cut -d' ' -f1) -m -p "
+               "-- /usr/bin/hciconfig -a 2>/dev/null | head -4");
+      FILE* g = popen(cmd, "r");
+      if (g) {
+        char ln[256];
+        while (fgets(ln, sizeof(ln), g)) fprintf(stderr, "[bthci] hciconfig| %s", ln);
+        pclose(g);
+      }
+    }
+    return 0;
+  }
   if (sweep) {
     // 让服务器自己报出每个事务码期望的参数形状：无参 / int32 / byte[] / binder
     // 判据 = HAL 日志里那句 status（NOT_ENOUGH_DATA / BAD_TYPE / ReadAndValidateArraySize…）
