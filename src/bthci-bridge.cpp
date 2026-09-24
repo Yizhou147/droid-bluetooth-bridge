@@ -198,7 +198,9 @@ enum : uint32_t {
 };
 // EnableReason / DisableReason 枚举值（AIDL）：0=OTHER/UNKNOWN，1/2/3 为其它原因；
 // 先按 0 发，不行再挨个试。
-static const int32_t kEnableReasons[] = {0, 1, 2, 3};
+// 实测 code=3 + int32 才会让 HAL 打开 bt_cp_ctrl/ttyHS；reason 具体取值待观察，
+// 按 1,0,2,3 顺序试（1 已被实测证明有效）
+static const int32_t kEnableReasons[] = {1, 0, 2, 3};
 // 回调方法码（1 transportReset 2 hciEvent 3 aclDataReceived 4 scoDataReceived 6 flowStatus）
 enum : uint32_t { kCbTransportReset = 1, kCbHciEvent = 2, kCbAcl = 3, kCbSco = 4, kCbFlowStatus = 6 };
 
@@ -209,6 +211,7 @@ static int g_sfd = -1;  // pty slave（挂了 N_HCI）
 static volatile sig_atomic_t g_run = 1;
 static std::mutex g_ptx;  // 回调可能在多个 binder 线程上 → 串行化 pty 写
 static AIBinder* g_hal = nullptr;
+static volatile unsigned long long g_toHal = 0, g_toKernel = 0;
 
 static void log(const char* fmt, ...) {
   va_list ap;
@@ -288,6 +291,7 @@ static void pumpToHal() {
     if (pos + need > acc.size()) break;
     const uint8_t* pkt = acc.data() + pos;
     size_t flen = need;
+    ++g_toHal;
     uint32_t code = type == 0x01 ? kSendCommand : type == 0x02 ? kSendAcl : kSendSco;
     AParcel* in = nullptr;
     if (ndk.Prepare(g_hal, &in) == ST_OK) {
@@ -337,6 +341,7 @@ static void toKernel(uint8_t h4type, const int8_t* data, size_t n) {
     flen = (n + 1 < sizeof(frame)) ? n + 1 : sizeof(frame);
     memcpy(frame + 1, data, flen - 1);
   }
+  ++g_toKernel;
   std::lock_guard<std::mutex> lk(g_ptx);
   if (write(g_mfd, frame, flen) < 0) log("写 pty 失败: %s", strerror(errno));
 }
@@ -540,6 +545,23 @@ int main(int argc, char** argv) {
     return v;
   };
 
+  auto halTransportFds = []() -> int {
+    char cmd[160];
+    snprintf(cmd, sizeof(cmd), "ls -l /proc/%d/fd 2>/dev/null | grep -cE 'bt_cp_ctrl|ttyHS'", halPid());
+    FILE* g = popen(cmd, "r");
+    int fds = -1;
+    if (g) { if (fscanf(g, "%d", &fds) != 1) fds = -2; pclose(g); }
+    return fds;
+  };
+  auto rfSoft = []() -> int {
+    FILE* f = fopen("/sys/class/rfkill/rfkill0/soft", "r");
+    if (!f) return -1;
+    int v = -2;
+    if (fscanf(f, "%d", &v) != 1) v = -3;
+    fclose(f);
+    return v;
+  };
+
   int initialized = 0;
   if (sweep) {
     // 让服务器自己报出每个事务码期望的参数形状：无参 / int32 / byte[] / binder
@@ -709,58 +731,20 @@ int main(int argc, char** argv) {
       log("✗ initialize 三种打法都不通（enable 未试）");
     } else {
       initialized = 1;
-      // enable(code 3) 带 EnableReason；oneway 的 st=0 只代表投递成功，
-      // 真判据是 HAL 有没有重新打开 bt_cp_ctrl/ttyHS 以及 rfkill0 是否解除阻塞。
+      // enable = 实测 code 3 + int32(EnableReason)。oneway 的 st=0 只代表投递成功，
+      // 所以判据用副作用：HAL 是否打开 bt_cp_ctrl/ttyHS、rfkill0 是否解除阻塞。
       {
         bool up = false;
         for (int32_t r : kEnableReasons) {
           binder_status_t est = callWith(kEnable, false, FLAG_ONEWAY, nullptr, r);
-          std::this_thread::sleep_for(std::chrono::seconds(4));
-          int soft = -1, fds = -1;
-          {
-            FILE* f = fopen("/sys/class/rfkill/rfkill0/soft", "r");
-            if (f) { if (fscanf(f, "%d", &soft) != 1) soft = -2; fclose(f); }
-            char cmd[160];
-            snprintf(cmd, sizeof(cmd), "ls -l /proc/%d/fd 2>/dev/null | grep -cE 'bt_cp_ctrl|ttyHS'", halPid());
-            FILE* g = popen(cmd, "r");
-            if (g) { if (fscanf(g, "%d", &fds) != 1) fds = -2; pclose(g); }
-          }
-          log("enable(reason=%d, code=%u) st=%d → rfkill0.soft=%d HAL传输fd=%d %s", r, kEnable, est,
-              soft, fds, (soft == 0 || fds > 0) ? "★ HAL 开始上电/开传输" : "");
+          std::this_thread::sleep_for(std::chrono::seconds(3));
+          int soft = rfSoft();
+          int fds = halTransportFds();
+          log("enable(reason=%d) 投递=%d → rfkill.soft=%d HAL传输fd=%d %s", r, est, soft, fds,
+              (soft == 0 || fds > 0) ? "★ HAL 已开传输/上电" : "");
           if (soft == 0 || fds > 0) { up = true; break; }
         }
-        if (!up) log("✗ enable(reason 0..3) 都没让 HAL 开传输——方法表或 stability 还得再查");
-      }
-      // enable 在新版 AIDL 里是 oneway（同步调会 EX_TRANSACTION_FAILED=-2147483647，实测如此）
-      int32_t ef = 0x7abc;
-      binder_status_t est = callWith(kEnable, false, FLAG_ONEWAY, nullptr);
-      log("enable/oneway → %d", est);
-      if (est != ST_OK) {
-        ef = 0x7abc;
-        binder_status_t est2 = callWith(kEnable, false, 0, &ef);
-        log("enable/sync → %d 回包首int32=%d", est2, ef);
-        if (est2 == ST_OK) est = est2;
-      }
-      if (est != ST_OK) {
-        // 新版签名：enable(EnableReason reason)
-        est = callWith(kEnable, false, FLAG_ONEWAY, nullptr, /*withInt=*/0);
-        log("enable/oneway+reason=0 → %d", est);
-        if (est != ST_OK) {
-          ef = 0x7abc;
-          binder_status_t est3 = callWith(kEnable, false, 0, &ef, 0);
-          log("enable/sync+reason=0 → %d 回包首int32=%d", est3, ef);
-        }
-      }
-      // 只读地看一眼芯片是否被 HAL 上电（绝不写 rfkill）
-      {
-        std::this_thread::sleep_for(std::chrono::seconds(3));
-        FILE* f = fopen("/sys/class/rfkill/rfkill0/soft", "r");
-        int soft = -1;
-        if (f) { if (fscanf(f, "%d", &soft) != 1) soft = -2; fclose(f); }
-        f = fopen("/sys/class/rfkill/rfkill0/state", "r");
-        int stt = -1;
-        if (f) { if (fscanf(f, "%d", &stt) != 1) stt = -2; fclose(f); }
-        log("enable 后 rfkill0: soft=%d state=%d（0=未阻塞即已上电）", soft, stt);
+        if (!up) log("✗ enable(reason 1/0/2/3) 都没让 HAL 开传输");
       }
     }
   }
@@ -778,11 +762,22 @@ int main(int argc, char** argv) {
 
   auto until = keep > 0 ? std::chrono::steady_clock::now() + std::chrono::seconds(keep)
                         : std::chrono::steady_clock::time_point::max();
+  int tick = 0;
   while (g_run && std::chrono::steady_clock::now() < until) {
     struct pollfd pf{g_mfd, POLLIN, 0};
     int s = poll(&pf, 1, 1000);
     if (s > 0 && (pf.revents & POLLIN)) pumpToHal();
     if (s < 0 && errno != EINTR) break;
+    if (++tick % 5 == 0) {
+      // 状态快照：内核侧是否已 up、HAL 传输是否开着、芯片是否解除阻塞
+      char cmd[160];
+      snprintf(cmd, sizeof(cmd), "cat /sys/class/bluetooth/hci0/flags 2>/dev/null || echo NODEV");
+      FILE* g = popen(cmd, "r");
+      char fl[64] = "?";
+      if (g) { if (!fgets(fl, sizeof(fl), g)) snprintf(fl, sizeof(fl), "ERR"); pclose(g); }
+      log("状态 hci0.flags=%s HALfd=%d rfkill.soft=%d 已转发包=%llu 收包=%llu", fl, halTransportFds(),
+          rfSoft(), (unsigned long long)g_toHal, (unsigned long long)g_toKernel);
+    }
   }
 
   log("退场：disable + close（把 HAL 交还给安卓 framework）");
