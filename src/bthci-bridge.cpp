@@ -135,6 +135,7 @@ static struct {
   binder_status_t (*Parcel_readByteArray)(const AParcel*, void*, fn_byteArrayAllocator);
   binder_status_t (*Parcel_writeStrongBinder)(AParcel*, AIBinder*);
   void (*Parcel_setDataPosition)(const AParcel*, int32_t);
+  size_t (*Parcel_getDataSize)(const AParcel*);
   void (*Parcel_delete)(AParcel*);
   void (*Proc_setThreadPoolMaxThreadCount)(uint32_t);
   void (*Proc_startThreadPool)(void);
@@ -168,6 +169,7 @@ static bool loadNdk() {
   ndk.Parcel_readByteArray = (decltype(ndk.Parcel_readByteArray))get("AParcel_readByteArray");
   ndk.Parcel_writeStrongBinder = (decltype(ndk.Parcel_writeStrongBinder))get("AParcel_writeStrongBinder");
   ndk.Parcel_setDataPosition = (decltype(ndk.Parcel_setDataPosition))get("AParcel_setDataPosition");
+  ndk.Parcel_getDataSize = (decltype(ndk.Parcel_getDataSize))get("AParcel_getDataSize");
   ndk.Parcel_delete = (decltype(ndk.Parcel_delete))get("AParcel_delete");
   ndk.Binder_isRemote = (decltype(ndk.Binder_isRemote))get("AIBinder_isRemote");
   ndk.Binder_isNative = (decltype(ndk.Binder_isNative))get("AIBinder_isNative");
@@ -456,7 +458,7 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
-  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false, search3 = false, search4 = false, search5 = false, search6 = false;
+  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false, search3 = false, search4 = false, search5 = false, search6 = false, why = false;
   int mapCode = 0;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
@@ -469,6 +471,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[i], "--map") && i + 1 < argc) {
       mapCode = atoi(argv[++i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "--why")) {
+      why = true;
       continue;
     }
     if (!strcmp(argv[i], "--search6")) {
@@ -644,6 +650,53 @@ int main(int argc, char** argv) {
   };
 
   int initialized = 0;
+  if (why) {
+    // 把回包整个读出来：int32 exceptionCode + int32 字符数 + UTF-16 文本。
+    // AParcel 只给 typed 读接口，所以逐 int32 取，再把 int32 拆成两个 UTF-16 单元。
+    static const uint8_t rst[4] = {0x01, 0x03, 0x0C, 0x00};
+    for (uint32_t code = 1; code <= 12; code++) {
+      if (!acquire()) continue;
+      binder_status_t ia = callWith(2, true, 0, nullptr);
+      AParcel* in = nullptr;
+      binder_status_t st = ndk.Prepare(g_hal, &in);
+      int words[16];
+      int nw = 0;
+      size_t sz = 0;
+      if (st == ST_OK) st = ndk.Parcel_writeByteArray(in, reinterpret_cast<const int8_t*>(rst), sizeof(rst));
+      if (st == ST_OK) {
+        AParcel* out = nullptr;
+        st = ndk.Transact(g_hal, code, &in, &out, 0);
+        if (out) {
+          if (ndk.Parcel_getDataSize) sz = ndk.Parcel_getDataSize(out);
+          if (ndk.Parcel_setDataPosition) ndk.Parcel_setDataPosition(out, 0);
+          while (nw < 16) {
+            int32_t w = 0;
+            if (!ndk.Parcel_readInt32 || ndk.Parcel_readInt32(out, &w) != ST_OK) break;
+            words[nw++] = w;
+          }
+          ndk.Parcel_delete(out);
+        }
+      }
+      // 解码：words[0]=异常码, words[1]=字符数, 之后是 UTF-16
+      char msg[128];
+      int mn = 0;
+      if (nw >= 2 && words[1] > 0 && words[1] < 40) {
+        int chars = words[1];
+        for (int i = 0; i < chars && mn < (int)sizeof(msg) - 4; i++) {
+          int wi = 2 + i / 2;
+          if (wi >= nw) break;
+          uint16_t u = (i % 2 == 0) ? (uint16_t)(words[wi] & 0xffff) : (uint16_t)((words[wi] >> 16) & 0xffff);
+          msg[mn++] = (u >= 0x20 && u < 0x7f) ? (char)u : '?';
+        }
+        msg[mn] = 0;
+      } else {
+        snprintf(msg, sizeof(msg), "(无文本, %zu 字节)", sz);
+      }
+      log("WHY code=%-2u init=%d 调用st=%d 异常码=%d 数据%zu字节 文本=\"%s\" words=%d", code, ia, st,
+          nw ? words[0] : -999, sz, msg, nw);
+    }
+    return 0;
+  }
   if (search6) {
     // S5 的错在于用 oneway 探测——oneway 拿不到任何服务端错误（st=0 只代表排队），
     // 而 S2/S3 已经证明**同步**调用会给出精确信号（-61 缺数据 / -12 长度不对 / 0 形状对）。
