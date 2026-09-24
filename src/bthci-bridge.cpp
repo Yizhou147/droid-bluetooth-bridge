@@ -99,6 +99,8 @@ static int kickHci(int up) {
 static uint32_t g_cmdCode = 5, g_aclCode = 6;
 static uint32_t g_enableCode = 4;
 static int g_enableArg = 1;
+static uint32_t g_initializeCode = 1;
+static int g_initializeOneway = 0;
 
 // ------------------------------------------------------------ libbinder_ndk 的最小声明
 struct AIBinder;
@@ -454,7 +456,7 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
-  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false, search3 = false;
+  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false, search3 = false, search4 = false;
   int mapCode = 0;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
@@ -467,6 +469,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[i], "--map") && i + 1 < argc) {
       mapCode = atoi(argv[++i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "--search4")) {
+      search4 = true;
       continue;
     }
     if (!strcmp(argv[i], "--search3")) {
@@ -630,6 +636,51 @@ int main(int argc, char** argv) {
   };
 
   int initialized = 0;
+  if (search4) {
+    // 假设：真正上电/开传输的是 initialize_aidl(callbacks)，它带 binder 参数
+    // （安卓自己开蓝牙时 HAL 打的就是 BluetoothHci::initialize_aidl() → OpenUart）。
+    // 老 initialize(code1) 我们发着也是 EX_NONE 但什么都不做。
+    // 另外注意：日志证明它可能是 **oneway**（S2 测出 code=2 是 oneway）。
+    for (uint32_t code = 1; code <= 8; code++) {
+      for (int of = 0; of < 2; of++) {  // 0=同步 1=oneway
+        if (!acquire()) { log("S4 code=%u 占位失败", code); continue; }
+        binder_status_t st = callWith(code, true, of ? FLAG_ONEWAY : 0, nullptr);
+        int fds = 0;
+        for (int k = 0; k < 8; k++) {
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+          fds = halTransportFds();
+          if (fds > 0) break;
+        }
+        log("S4 code=%u %s 带回调 → st=%d HALfd=%d %s", code, of ? "oneway" : "sync  ", st,
+            fds, fds > 0 ? "★★★ 就是它（开传输）" : "");
+        if (fds > 0) {
+          g_initializeCode = code;
+          g_initializeOneway = of;
+          // 接着让内核发第一帧，扫数组类码位当 sendHciCommand
+          for (uint32_t c = 1; c <= 8; c++) {
+            g_cmdCode = c;
+            g_toKernel = 0;
+            kickHci(1);
+            for (int k = 0; k < 4; k++) {
+              std::this_thread::sleep_for(std::chrono::seconds(1));
+              struct pollfd pf{g_mfd, POLLIN, 0};
+              if (poll(&pf, 1, 100) > 0 && (pf.revents & POLLIN)) pumpToHal();
+              if (g_toKernel > 0) break;
+            }
+            log("   S4b cmdCode=%u → 收回=%llu %s", c, (unsigned long long)g_toKernel,
+                g_toKernel > 0 ? "★★★ sendHciCommand 就是它" : "");
+            if (g_toKernel > 0) { log("★★★ 两个码位都定了：initialize=%u(%s) sendHciCommand=%u",
+                                      g_initializeCode, g_initializeOneway ? "oneway" : "sync", c);
+              return 0; }
+            kickHci(0);
+          }
+          return 1;
+        }
+      }
+    }
+    log("✗ S4：没有哪个码带回调能开传输");
+    return 1;
+  }
   if (search3) {
     // 分类剩余码位：先用**同步无参**探它是不是 oneway / 要不要参数，
     // 再用 **oneway 无参 + 轮询 HAL fd 10 秒**判它是不是 enable。
