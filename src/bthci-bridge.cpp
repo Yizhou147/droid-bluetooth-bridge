@@ -253,7 +253,7 @@ static int g_sfd = -1;  // pty slave（挂了 N_HCI）
 static volatile sig_atomic_t g_run = 1;
 static std::mutex g_ptx;  // 回调可能在多个 binder 线程上 → 串行化 pty 写
 static AIBinder* g_hal = nullptr;
-static volatile unsigned long long g_toHal = 0, g_toKernel = 0;
+static volatile unsigned long long g_toHal = 0, g_toKernel = 0, g_cbEvents = 0;
 
 static void log(const char* fmt, ...) {
   va_list ap;
@@ -456,7 +456,7 @@ static binder_status_t callVoid(uint32_t code, bool oneway) {
 
 int main(int argc, char** argv) {
   int keep = 0;
-  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false, search3 = false, search4 = false;
+  bool probe4 = false, probe5 = false, probeEnable = false, sweep = false, autotune = false, search = false, search2 = false, search3 = false, search4 = false, search5 = false;
   int mapCode = 0;
   for (int i = 1; i < argc; i++) {
     if (!strcmp(argv[i], "--probe4")) {
@@ -469,6 +469,10 @@ int main(int argc, char** argv) {
     }
     if (!strcmp(argv[i], "--map") && i + 1 < argc) {
       mapCode = atoi(argv[++i]);
+      continue;
+    }
+    if (!strcmp(argv[i], "--search5")) {
+      search5 = true;
       continue;
     }
     if (!strcmp(argv[i], "--search4")) {
@@ -636,6 +640,66 @@ int main(int argc, char** argv) {
   };
 
   int initialized = 0;
+  if (search5) {
+    // §17 修正版：每组都是完整序列 acquire → initialize_aidl(2,sync,带回调)，
+    // 然后**我们自己注入一条 HCI_Reset**（不依赖内核何时发），
+    // 判据 = 回调里是否真的收到 hciEvent（g_cbEvents）+ HAL 传输 fd。
+    // 维度：cmdCode × 负载含/不含 H4 类型字节。
+    static const uint8_t resetWith[4] = {0x01, 0x03, 0x0C, 0x00};  // H4 cmd + opcode 0x0c03 + len0
+    static const uint8_t resetWo[3] = {0x03, 0x0C, 0x00};
+    bool found = false;
+    for (int it = 1; it >= 0 && !found; it--) {
+      for (uint32_t code = 2; code <= 9 && !found; code++) {
+        if (!acquire()) { log("S5 type=%d code=%u 占位失败", it, code); continue; }
+        binder_status_t ia = callWith(2, true, 0, nullptr);  // initialize_aidl(callbacks)
+        int fdAfterInit = halTransportFds();
+        g_cbEvents = 0;
+        AParcel* in = nullptr;
+        binder_status_t st = ndk.Prepare(g_hal, &in);
+        if (st == ST_OK) {
+          const uint8_t* pl = it ? resetWith : resetWo;
+          size_t n = it ? sizeof(resetWith) : sizeof(resetWo);
+          st = ndk.Parcel_writeByteArray(in, reinterpret_cast<const int8_t*>(pl), n);
+          if (st == ST_OK) {
+            AParcel* out = nullptr;
+            st = ndk.Transact(g_hal, code, &in, &out, FLAG_ONEWAY);
+            if (out) ndk.Parcel_delete(out);
+          }
+        }
+        int got = 0;
+        for (int k = 0; k < 5; k++) {
+          std::this_thread::sleep_for(std::chrono::seconds(1));
+          if (g_cbEvents > 0) { got = 1; break; }
+        }
+        int fds = halTransportFds();
+        log("S5 type=%d code=%u initA=%d(fd=%d) 注入=%d → 收到event=%llu HALfd=%d %s", it, code, ia,
+            fdAfterInit, st, (unsigned long long)g_cbEvents, fds,
+            got ? "★★★ sendHciCommand 就是它" : "");
+        if (got) { g_cmdCode = code; g_include_type = (it == 1); initialized = 1; found = true; }
+      }
+    }
+    if (!found) { log("✗ S5 没找到 sendHciCommand"); return 1; }
+    log("★★★ 定板：initialize_aidl=2(sync) / sendHciCommand=%u（负载%s类型字节）", g_cmdCode,
+        g_include_type ? "含" : "不含");
+    // 现在就试着让内核 up，看能不能走到读真实 BD_ADDR
+    kickHci(1);
+    for (int k = 0; k < 8; k++) {
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      struct pollfd pf{g_mfd, POLLIN, 0};
+      if (poll(&pf, 1, 200) > 0 && (pf.revents & POLLIN)) pumpToHal();
+    }
+    {
+      char cmd[224];
+      snprintf(cmd, sizeof(cmd),
+               "P=$(ps -A -o PID,NAME | grep -w bluetoothd | head -1 | cut -d' ' -f1); "
+               "nsenter -t $P -m -p -- /usr/bin/hciconfig -a 2>/dev/null | head -3");
+      FILE* g = popen(cmd, "r");
+      if (g) { char ln[256]; while (fgets(ln, sizeof(ln), g)) fprintf(stderr, "[bthci] HCICFG| %s", ln); pclose(g); }
+    }
+    log("S5 结束：转发=%llu 收回=%llu event=%llu", (unsigned long long)g_toHal,
+        (unsigned long long)g_toKernel, (unsigned long long)g_cbEvents);
+    return 0;
+  }
   if (search4) {
     // 假设：真正上电/开传输的是 initialize_aidl(callbacks)，它带 binder 参数
     // （安卓自己开蓝牙时 HAL 打的就是 BluetoothHci::initialize_aidl() → OpenUart）。
