@@ -19,7 +19,13 @@
 //       adb shell su -c '/data/local/tmp/bthci-bridge --keep 3600'
 
 #include <android/binder_ibinder.h>
+#if __has_include(<android/binder_manager.h>)
 #include <android/binder_manager.h>
+#else
+// 某些 NDK 版本不装 binder_manager.h；符号本身在 libbinder_ndk.so 里（API 31+）
+extern "C" AIBinder* AServiceManager_getService(const char* instance);
+extern "C" AIBinder* AServiceManager_waitForService(const char* instance);
+#endif
 #include <android/binder_parcel.h>
 #include <android/binder_process.h>
 #include <android/binder_status.h>
