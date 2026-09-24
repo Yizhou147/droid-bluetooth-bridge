@@ -38,6 +38,7 @@
 #include <unistd.h>
 
 #include <chrono>
+#include <thread>
 
 #ifndef TIOCSETD
 #define TIOCSETD 0x541b
@@ -453,10 +454,14 @@ int main(int argc, char** argv) {
   // "从 servicemanager 拿来的 vendor 稳定 binder"（C++ 的 service call 不受此限，
   // 它走 BpBinder::transact）。绕法 Path A：用同 descriptor 的**本地** binder 当
   // parcel 工厂（Prepare 会写进正确的 interface token），再把 parcel 发给 vendor 句柄。
-  auto callWith = [&](uint32_t code, bool withCb, uint32_t flags, int32_t* firstReply) -> binder_status_t {
+  // withInt>=0 时额外写一个 int32（新版 AIDL 的 enable(EnableReason)/disable(DisableReason)）
+  auto callWith = [&](uint32_t code, bool withCb, uint32_t flags, int32_t* firstReply,
+                      int withInt = -1) -> binder_status_t {
     AParcel* in = nullptr;
     binder_status_t st = ndk.Prepare(g_hal, &in);
     if (st == ST_OK && withCb) st = ndk.Parcel_writeStrongBinder(in, cb);
+    if (st == ST_OK && withInt >= 0 && ndk.Parcel_writeInt32)
+      st = ndk.Parcel_writeInt32(in, withInt);
     AParcel* out = nullptr;
     if (st == ST_OK) {
       st = ndk.Transact(g_hal, code, &in, &out, flags);
@@ -528,17 +533,46 @@ int main(int argc, char** argv) {
       log("initialize(B/in=nullptr) → st=%d", st);
     }
     if (st != ST_OK) {
-      log("✗ initialize 三种打法都不通");
+      log("✗ initialize 三种打法都不通（enable 未试）");
     } else {
       initialized = 1;
+      // enable 在新版 AIDL 里是 oneway（同步调会 EX_TRANSACTION_FAILED=-2147483647，实测如此）
       int32_t ef = 0x7abc;
-      log("enable → %d 回包首int32=%d", callWith(kEnable, false, 0, &ef), ef);
+      binder_status_t est = callWith(kEnable, false, FLAG_ONEWAY, nullptr);
+      log("enable/oneway → %d", est);
+      if (est != ST_OK) {
+        ef = 0x7abc;
+        binder_status_t est2 = callWith(kEnable, false, 0, &ef);
+        log("enable/sync → %d 回包首int32=%d", est2, ef);
+        if (est2 == ST_OK) est = est2;
+      }
+      if (est != ST_OK) {
+        // 新版签名：enable(EnableReason reason)
+        est = callWith(kEnable, false, FLAG_ONEWAY, nullptr, /*withInt=*/0);
+        log("enable/oneway+reason=0 → %d", est);
+        if (est != ST_OK) {
+          ef = 0x7abc;
+          binder_status_t est3 = callWith(kEnable, false, 0, &ef, 0);
+          log("enable/sync+reason=0 → %d 回包首int32=%d", est3, ef);
+        }
+      }
+      // 只读地看一眼芯片是否被 HAL 上电（绝不写 rfkill）
+      {
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+        FILE* f = fopen("/sys/class/rfkill/rfkill0/soft", "r");
+        int soft = -1;
+        if (f) { if (fscanf(f, "%d", &soft) != 1) soft = -2; fclose(f); }
+        f = fopen("/sys/class/rfkill/rfkill0/state", "r");
+        int stt = -1;
+        if (f) { if (fscanf(f, "%d", &stt) != 1) stt = -2; fclose(f); }
+        log("enable 后 rfkill0: soft=%d state=%d（0=未阻塞即已上电）", soft, stt);
+      }
     }
   }
 
   if (!initialized) {
     log("未拿到 HAL 客户端位，直接退场");
-    callVoid(kDisable, false);
+    callVoid(kDisable, true);
     callVoid(kClose, true);
     int back = N_TTY;
     ioctl(g_sfd, TIOCSETD, &back);
@@ -557,7 +591,7 @@ int main(int argc, char** argv) {
   }
 
   log("退场：disable + close（把 HAL 交还给安卓 framework）");
-  callVoid(kDisable, false);
+  callVoid(kDisable, true);
   callVoid(kClose, true);
   if (ndk.DecStrong) ndk.DecStrong(cb);
   int back = N_TTY;
