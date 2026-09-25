@@ -226,6 +226,7 @@ static binder_status_t noopTransact(AIBinder*, transaction_code_t, const AParcel
 // 内核 hci_uart(H4) 那侧必须带类型字节，所以桥自己负责加/减。
 static bool g_include_type = false;  // 内核→HAL：写进 byte[] 的负载带不带 H4 类型字节
 static bool g_cb_has_type = false;   // HAL→内核：回调 byte[] 里带不带 H4 类型字节
+static bool g_fuse = true;           // 安卓框架一起来就自退（见 frameworkAlive 的注释）
 static int g_mfd = -1;              // pty master
 static int g_sfd = -1;              // pty slave（挂了 N_HCI）
 static volatile sig_atomic_t g_run = 1;
@@ -484,6 +485,20 @@ static int rfSoft() {
   return v;
 }
 
+// 自熔断判据：安卓框架活着 = 它的蓝牙栈和**我们**同时持有 IBluetoothHci 客户端位，
+// 两颗客户端抢同一颗 WiFi+BT combo 芯片的电源协调（btpower/cnss）。09-25 实测连着两轮
+// 把安卓 WiFi 打进 `is_driver_recovering 1 / Driver Loading Timed-out!!` 死循环，
+// 停桥也解不开，只能整机重启。⇒ 绝不允许"安卓活着 + 桥也活着"。
+// 读不到属性时**不自杀**（保守：判据不确定就别动手）。
+static bool frameworkAlive() {
+  FILE* f = popen("getprop init.svc.surfaceflinger 2>/dev/null", "r");
+  if (!f) return false;
+  char buf[32] = {};
+  int got = f ? static_cast<int>(fgets(buf, sizeof(buf), f) ? 1 : 0) : 0;
+  pclose(f);
+  return got == 1 && strncmp(buf, "running", 7) == 0;
+}
+
 // HAL 自己很啰嗦，它抱怨的那一行往往就是答案（固件下载失败/IBS 超时/权限）。
 // 安卓 framework 死了 logd 照样在（class core），所以接管期也能读。
 static void dumpHalLog(int n) {
@@ -601,6 +616,8 @@ int main(int argc, char** argv) {
       g_cb_has_type = true;
     else if (!strcmp(argv[i], "--no-kick"))
       kick = false;
+    else if (!strcmp(argv[i], "--no-fuse"))
+      g_fuse = false;
     else if (!strcmp(argv[i], "--cmd") && i + 1 < argc) {
       cmdMode = true;
       cmdHex = argv[++i];
@@ -615,7 +632,7 @@ int main(int argc, char** argv) {
       return 0;
     } else {
       fprintf(stderr,
-              "用法: %s [--keep <秒>] [--no-kick] [--with-type-byte] [--cb-with-type] "
+              "用法: %s [--keep <秒>] [--no-kick] [--no-fuse] [--with-type-byte] [--cb-with-type] "
               "[--cmd <hex>] [--codes]\n"
               "  默认：注册 hci0 + initialize + 双向搬运（keep 秒）\n"
               "  --cmd 011000：不经内核，直接用 sendHciCommand 发一条命令（**不带** H4 类型字节），"
@@ -728,6 +745,11 @@ int main(int argc, char** argv) {
       if (s > 0 && (pf.revents & POLLIN)) pumpToHal();
       if (s < 0 && errno != EINTR) break;
       if (++tick % 10 == 0) {
+        if (g_fuse && frameworkAlive()) {
+          log("★ 熔断：安卓框架已活着（surfaceflinger=running）⇒ 立刻退场，"
+              "把 HAL 客户端位和 hci0 还给安卓（桥与安卓蓝牙栈不能同时存在）");
+          break;
+        }
         char fl[64] = "?";
         FILE* g = popen("cat /sys/class/bluetooth/hci0/flags 2>/dev/null || echo NODEV", "r");
         if (g) {
