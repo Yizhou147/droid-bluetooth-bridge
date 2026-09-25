@@ -80,6 +80,8 @@ pkill -x bthci-bridge        # 退场，hci0 自动注销
 
 ## 状态
 
+最新可用产物见 [Releases](https://github.com/Yizhou147/droid-bluetooth-bridge/releases)（当前 v0.1.0 = 自熔断版，含安装/运行/退场用法）。
+
 **M0–M3 全部实测通过**：真 BD_ADDR、`power on`、扫描、BLE 鼠标**连上即可用**、ACL 双向
 （`RX acl:209 / TX acl:50`）、同开机多轮往返稳定。M4 收尾中：A2DP 出声未实测、安卓 UI 手动
 开关蓝牙的交还回归未测、配对密钥不与安卓共享（接管期连外设需重配一次）、桥长跑稳定性观察中。
