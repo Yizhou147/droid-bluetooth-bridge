@@ -1,3 +1,5 @@
+中文 | [English](README_english.md)
+
 # droid-bluetooth-bridge — 让 DRM 接管桌面直接用上蓝牙（vendor HAL 的 HCI 客户端）
 
 在 Xiaomi Pad 8 Pro 上做纯 DRM/KMS 接管（KWin 持屏、安卓 framework 被 `stop`）时，
@@ -40,7 +42,7 @@ uinput、不需要自造配对 UI、不需要新内核模块。
 
 | 路径 | 内容 |
 |---|---|
-| `蓝牙原生方案.md` | 完整设计与全程实测记录：事实基线 F1–F22、已否路线 A–G、里程碑 M0–M4、红线、交接口 |
+| `蓝牙原生方案.md` | 完整设计与全程实测记录：事实基线 F1–F22、已否路线 A–G、里程碑 M0–M4、红线、交接口（本 README 的英文版见 [README_english.md](README_english.md)） |
 | `src/bthci-bridge.cpp` | 主体：pty+N_HCI+H4 造 hci0、`libbinder_ndk` 客户端、H4 双向搬运、**自熔断**（每 10s 查 `init.svc.surfaceflinger`，一旦 running 立刻自退——桥与安卓蓝牙栈绝不许同时活着） |
 | `build.sh` / `.github/workflows/build.yml` | NDK 交叉编译（本机 arm64 无 NDK，放 GitHub Actions） |
 | `artifact/bthci-bridge-aarch64/bthci-bridge` | CI 产物，主项目 `desk-takeover` 直接用这台设备的现役版 |
