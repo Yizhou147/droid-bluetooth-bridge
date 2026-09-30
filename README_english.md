@@ -43,6 +43,8 @@ just reads them. No uinput, no custom pairing UI, no new kernel modules.
 | `byte[]` payloads in **both** directions do **not** include the H4 type byte; the kernel side needs it, so the bridge adds/strips it | Measured A/B with and without |
 | Callbacks `2 hciEventReceived / 3 initializationComplete`; on Android 15/16 the parcel argument offset = `16 + align4(name_length*2+2)` (measured: 116); you must explicitly `setDataPosition` before every read | Measured |
 | The HAL swallows replies for commands it sent internally (e.g. its own `HCI_Reset`) | logcat `Received event for command sent internally` |
+| On this kernel a full pty returns **EAGAIN, not a short write** (measured: EAGAIN after 17408 bytes, 0 partial writes) ⇒ "leaving a half packet behind" is not something that happens by itself; the real risk is a **blocking write parking the binder callback thread** (`dataCallback` is synchronous, so blocking it stalls the HAL event pump). The master is therefore O_NONBLOCK and the rule is "**write the packet completely, or don't write a single byte of it**": drop only if nothing has gone out yet and the deadline passed; never abandon a started packet | `make test` (`tests/pty_write_policy_test.cpp`, real pty) |
+| The kernel HCI core keeps only one command in flight: **losing a single Command Complete wedges the whole channel permanently** (09-30 signature: `hci0: command 0x0402 tx timeout` + `Unable to disable scanning: -110`, while events still grew at 143/s and `Powered` stayed `yes`). The bridge now instruments outstanding commands and the pty write path (full / partial / EAGAIN / drops / max block time) | `dmesg` + the bridge status line |
 
 ## Repository layout
 

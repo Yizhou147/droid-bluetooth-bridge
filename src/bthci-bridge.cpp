@@ -27,9 +27,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include "h4framing.h"
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -238,6 +241,25 @@ static volatile unsigned long long g_toHal = 0, g_toKernel = 0, g_cbEvents = 0, 
 static volatile unsigned long long g_cbInitSeen = 0;
 static volatile int g_cbInitStatus = -1000;  // -1000 = 还没收到 initializationComplete
 
+// 写 pty 这一路的自我计量。09-30 那次"命令方向全哑、事件方向洪水"的定位之所以只能靠反推，
+// 就是因为这里一个数都没留：短写/EAGAIN/阻塞时长/丢弃包数，全都是黑箱。
+// 宿主机 pty 实验（本机内核）证明 pty 写满时返回 EAGAIN 而非短写，但**那是 N_TTY**；
+// 挂着 N_HCI 的 slave 侧接收余量由内核 HCI 收包速度决定，所以两件事都得测着看：
+//   ① 真的短写了吗（partial 计数）② 回调线程被阻塞了多久（max_block_ms）——
+//   后者如果很大，说明"卡住 binder 回调线程 = 卡住 HAL 事件泵"这条链成立。
+static volatile unsigned long long g_w_full = 0, g_w_partial = 0, g_w_again = 0;
+static volatile unsigned long long g_w_err = 0, g_w_drop = 0, g_w_bytes = 0;
+static volatile long long g_w_max_block_ms = 0;
+static volatile unsigned long long g_frame_multi = 0, g_frame_short = 0, g_frame_bad = 0;
+static volatile long long g_w_timeout_ms = 1000;   // 一包最多堵多久，超时整包丢弃（--w-timeout 改）
+
+// 在途命令：内核 HCI 一次只允许一条命令在飞，**丢一次 Command Complete 整条通道就永久哑**
+// （09-30 19:2x 实测签名：`hci0: command 0x0402 tx timeout` 每 2s 刷 + `Unable to disable
+// scanning: -110`，而 events 仍以 143/s 在涨）。记下"发了哪条、几时发的"，下次哑就能
+// 指认是哪条命令丢的应答，而不是像今天这样反推。
+static std::mutex g_cmdx;
+static std::map<uint16_t, long long> g_outstanding;   // opcode → 发出时刻(ms)
+
 static void log(const char* fmt, ...) {
   va_list ap;
   va_start(ap, fmt);
@@ -285,6 +307,11 @@ static bool attachHci() {
   }
   g_mfd = mfd;
   g_sfd = sfd;
+  // master 设非阻塞：默认阻塞写会在 pty 缓冲满时把**binder 回调线程**堵住，
+  // 而 dataCallback 是同步的 → 卡住它就等于卡住 HAL 的事件泵（这正是"事件还在、命令全哑"
+  // 那条链的候选）。改成非阻塞后由 writeFrame 用 poll 有界等待，超时整包丢弃并记账。
+  int fl = fcntl(mfd, F_GETFL, 0);
+  if (fl >= 0) fcntl(mfd, F_SETFL, fl | O_NONBLOCK);
   int disc = N_HCI;
   if (ioctl(sfd, TIOCSETD, &disc) < 0) {
     log("TIOCSETD N_HCI 失败: %s（需要 root）", strerror(errno));
@@ -302,21 +329,122 @@ static bool attachHci() {
 // HAL → 内核：补上 H4 类型字节写进 pty master。
 // HAL 给的数组是否自带类型字节**不靠猜**（事件码 0x01~0x05 和类型字节取值范围重叠，
 // 首字节启发式一定会读错），用 --cb-with-type 显式切换，实测哪边通定哪边。
+
+static long long now_ms() {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+// 一个完整 H4 包写进 master：**要么整包写完，要么一个字节都不写**。
+// 半路放弃等于往流里留半包，那正是"内核 H4 跑偏 → 命令方向永久哑"的成因，所以：
+//   · 还没开始写（off==0）且已超过 g_w_timeout_ms ⇒ 丢整包（安全，流保持对齐）并记账；
+//   · 已经写了一半 ⇒ 绝不放弃，poll 等到内核腾出缓冲再继续（超过 30s 才硬停并大声报，
+//     因为那时这一轮已经废了，让 binder 回调线程无限挂着只会把情况弄得更脏）。
+static bool writeFrame(const uint8_t* buf, size_t len) {
+  size_t off = 0;
+  long long t0 = now_ms();
+  bool warned = false;
+  for (;;) {
+    ssize_t r = write(g_mfd, buf + off, len - off);
+    if (r > 0) {
+      if ((size_t)r < len - off) ++g_w_partial;
+      off += (size_t)r;
+      if (off == len) break;
+      continue;
+    }
+    if (r < 0 && errno == EINTR) continue;
+    if (r < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      ++g_w_again;
+    } else if (r < 0) {
+      ++g_w_err;
+      log("写 pty 失败: %s", strerror(errno));
+      break;
+    }
+    long long el = now_ms() - t0;
+    if (h4::may_drop(off, el, g_w_timeout_ms)) {
+      ++g_w_drop;
+      log("★ 整包未开始即丢弃 %zu 字节（一个字节都没写，流不会跑偏；累计 drop=%llu again=%llu）",
+          len, g_w_drop, g_w_again);
+      g_w_bytes += off;
+      return false;
+    }
+    if (off > 0 && !warned && el > g_w_timeout_ms) {
+      warned = true;
+      log("★ 半包必须写完：已写 %zu/%zu，等内核腾缓冲（%lldms，partial 累计=%llu）——"
+          "这里放弃就等于留下半包，所以不放弃", off, len, el, g_w_partial);
+    }
+    if (el > 30000) {
+      ++g_w_err;
+      log("★ BT-DESYNC-RISK：半包卡死 30s 仍写不完（off=%zu/%zu），只好收手——"
+          "这条之后内核 H4 极可能已跑偏，请直接重拉桥", off, len);
+      break;
+    }
+    struct pollfd pf{g_mfd, POLLOUT, 0};
+    poll(&pf, 1, (int)h4::poll_slice_ms(el));
+  }
+  long long block = now_ms() - t0;
+  if (block > g_w_max_block_ms) g_w_max_block_ms = block;   // 回调线程被堵住多久 = 关键嫌疑量
+  g_w_bytes += off;
+  if (off == len) {
+    ++g_w_full;
+    return true;
+  }
+  ++g_w_drop;
+  log("★ 包没写全：%zu/%zu 字节（本次阻塞 %lldms；partial=%llu again=%llu err=%llu drop=%llu）",
+      off, len, block, g_w_partial, g_w_again, g_w_err, g_w_drop);
+  return false;
+}
+
+// 事件包里的 Command Complete / Command Status 用来清"在途命令"
+static void trackReply(const uint8_t* f, size_t flen) {
+  if (flen < 3 || f[0] != 0x04) return;
+  size_t op_off = 0;
+  if (f[1] == 0x0e && flen >= 6)
+    op_off = 4;   // [04][0e][plen][ncmd][op_lo][op_hi][status]
+  else if (f[1] == 0x0f && flen >= 7)
+    op_off = 5;   // [04][0f][plen][status][ncmd][op_lo][op_hi]
+  else
+    return;
+  uint16_t op = (uint16_t)(f[op_off] | (f[op_off + 1] << 8));
+  std::lock_guard<std::mutex> lk(g_cmdx);
+  g_outstanding.erase(op);
+}
+
 static void toKernel(uint8_t h4type, const int8_t* data, size_t n) {
   if (n == 0 || g_mfd < 0) return;
-  uint8_t frame[2048];
-  size_t flen = 0;
-  if (g_cb_has_type) {
-    flen = n < sizeof(frame) ? n : sizeof(frame);
-    memcpy(frame, data, flen);
-  } else {
-    frame[0] = h4type;
-    flen = (n + 1 < sizeof(frame)) ? n + 1 : sizeof(frame);
-    memcpy(frame + 1, data, flen - 1);
-  }
+  std::vector<uint8_t> frame;
+  frame.reserve(n + 1);
+  if (!g_cb_has_type) frame.push_back(h4type);
+  const uint8_t* p = (const uint8_t*)data;
+  frame.insert(frame.end(), p, p + n);
   ++g_toKernel;
+  trackReply(frame.data(), frame.size());
+
   std::lock_guard<std::mutex> lk(g_ptx);
-  if (write(g_mfd, frame, flen) < 0) log("写 pty 失败: %s", strerror(errno));
+  size_t pos = 0;
+  while (pos < frame.size()) {
+    size_t seg = 0;
+    h4::Kind k = h4::classify(frame.data() + pos, frame.size() - pos, &seg);
+    if (k == h4::Kind::kMulti) {
+      // 一次回调带了多个包：按边界拆开写（旧写法会把它们当一个包写出去 = 直接把流写歪）
+      ++g_frame_multi;
+      log("★ 一次回调带了多个 H4 包：先写 %zu 字节，剩 %zu 字节继续", seg, frame.size() - pos - seg);
+      writeFrame(frame.data() + pos, seg);
+      pos += seg;
+      continue;
+    }
+    if (k == h4::Kind::kShort) {
+      ++g_frame_short;
+      log("★ H4 长度对不上：type=0x%02x 声称 %zu 字节，实际只有 %zu —— 仍整块写出，但这行就是跑偏现场",
+          frame[pos], seg, frame.size() - pos);
+    } else if (k == h4::Kind::kBadType) {
+      ++g_frame_bad;
+      log("★ 未知 H4 类型 0x%02x（整块写出，不猜边界）", frame[pos]);
+    }
+    writeFrame(frame.data() + pos, frame.size() - pos);   // 其余情形：整块，与旧行为一致
+    break;
+  }
 }
 
 // 手写服务端不会自动 enforceInterface，得自己跳过 token 才能读到参数。
@@ -572,6 +700,11 @@ static void pumpToHal() {
     if (pos + need > acc.size()) break;
     const uint8_t* pkt = acc.data() + pos;
     ++g_toHal;
+    if (type == 0x01 && need >= 3) {
+      uint16_t op = (uint16_t)(pkt[1] | (pkt[2] << 8));
+      std::lock_guard<std::mutex> lk(g_cmdx);
+      g_outstanding[op] = now_ms();
+    }
     uint32_t code = type == 0x01 ? kSendCommand : type == 0x02 ? kSendAcl
                                              : type == 0x03    ? kSendSco
                                                                : kSendIso;
@@ -618,6 +751,8 @@ int main(int argc, char** argv) {
       kick = false;
     else if (!strcmp(argv[i], "--no-fuse"))
       g_fuse = false;
+    else if (!strcmp(argv[i], "--w-timeout") && i + 1 < argc)
+      g_w_timeout_ms = atoll(argv[++i]);   // 一包写 pty 最多堵多久(ms)，超时整包丢弃
     else if (!strcmp(argv[i], "--cmd") && i + 1 < argc) {
       cmdMode = true;
       cmdHex = argv[++i];
@@ -633,8 +768,10 @@ int main(int argc, char** argv) {
     } else {
       fprintf(stderr,
               "用法: %s [--keep <秒>] [--no-kick] [--no-fuse] [--with-type-byte] [--cb-with-type] "
-              "[--cmd <hex>] [--codes]\n"
+              "[--cmd <hex>] [--codes] [--w-timeout <ms>]\n"
               "  默认：注册 hci0 + initialize + 双向搬运（keep 秒）\n"
+              "  --w-timeout 一包写 pty 最多堵多久（默认 1000ms）；超时**整包丢弃**并记账，"
+              "绝不写半包——半包会让内核 H4 解析永久跑偏\n"
               "  --cmd 011000：不经内核，直接用 sendHciCommand 发一条命令（**不带** H4 类型字节），"
               "只看回调\n",
               argv[0]);
@@ -756,10 +893,25 @@ int main(int argc, char** argv) {
           if (!fgets(fl, sizeof(fl), g)) snprintf(fl, sizeof(fl), "ERR");
           pclose(g);
         }
-        log("状态 hci0.flags=%s 转发=%llu 收回=%llu 回调=%llu event=%llu HALfd=%d rfkill.soft=%d",
+        // 在途命令摘要：哑掉的那一刻，这里会留下"哪条命令没应答、已经等多久"
+        char oc[96] = "无";
+        {
+          std::lock_guard<std::mutex> lk(g_cmdx);
+          long long oldest = 0; uint16_t oop = 0;
+          for (auto& kv : g_outstanding)
+            if (oldest == 0 || kv.second < oldest) { oldest = kv.second; oop = kv.first; }
+          if (oldest)
+            snprintf(oc, sizeof(oc), "%d 条，最老 op=0x%04x 等 %lldms",
+                     (int)g_outstanding.size(), oop, now_ms() - oldest);
+        }
+        log("状态 hci0.flags=%s 转发=%llu 收回=%llu 回调=%llu event=%llu HALfd=%d rfkill.soft=%d"
+            " 在途命令=[%s] 写pty=[full=%llu 短写=%llu 再次=EAGAIN=%llu 错=%llu 丢=%llu"
+            " 最大阻塞=%lldms] 拆包=[多=%llu 短=%llu 怪=%llu]",
             fl, (unsigned long long)g_toHal, (unsigned long long)g_toKernel,
             (unsigned long long)g_cbAny, (unsigned long long)g_cbEvents, halTransportFds(),
-            rfSoft());
+            rfSoft(), oc,
+            g_w_full, g_w_partial, g_w_again, g_w_err, g_w_drop, g_w_max_block_ms,
+            g_frame_multi, g_frame_short, g_frame_bad);
       }
     }
     rc = 0;

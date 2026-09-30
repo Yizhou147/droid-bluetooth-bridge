@@ -37,6 +37,8 @@ uinput、不需要自造配对 UI、不需要新内核模块。
 | 两个方向的 `byte[]` 都**不含 H4 类型字节**；内核那侧要带，桥自己加/减 | 含/不含实测对照 |
 | 回调 `2 hciEventReceived / 3 initializationComplete`；Android 15/16 parcel 参数起点 = `16 + align4(名字长度*2+2)`（实测 116），读前必须显式 `setDataPosition` | 实测 |
 | HAL 会吞掉它内部已发命令的回包（如它自己发过的 `HCI_Reset`） | logcat `Received event for command sent internally` |
+| pty 写满时这台内核返回 **EAGAIN，不是短写**（实测 17408 字节后 EAGAIN、短写 0 次）⇒ "留半包"不是自然发生的，真正的风险是**阻塞写把 binder 回调线程挂住**（`dataCallback` 是同步的，卡住它=卡住 HAL 事件泵）。所以 master 已设非阻塞，并执行"**要么整包写完，要么一个字节都不写**"：没开头且超时才丢整包，写了一半绝不放弃 | `make test`（`tests/pty_write_policy_test.cpp`，真 pty 实测） |
+| 内核 HCI 一次只允许一条命令在飞：**丢一次 Command Complete 就整条通道永久哑**（09-30 签名 `hci0: command 0x0402 tx timeout` + `Unable to disable scanning: -110`，同时 events 仍以 143/s 涨、`Powered` 却仍是 `yes`）。⇒ 桥现在打点在途命令与写 pty 的 full/短写/EAGAIN/丢弃/最大阻塞时长 | `dmesg` + 桥状态行 |
 
 ## 目录
 

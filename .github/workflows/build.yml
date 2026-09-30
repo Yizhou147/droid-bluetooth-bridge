@@ -10,6 +10,8 @@ on:
   push:
     paths:
       - "src/**"
+      - "tests/**"
+      - "Makefile"
       - "build.sh"
       - ".github/workflows/build.yml"
 
@@ -18,6 +20,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # 纯逻辑单测先跑：拆包/写全这套东西一旦回归，就不该再花时间出二进制
+      - name: 宿主机单测（H4 拆包 / 写全）
+        run: make test
 
       # 先看 runner 给了什么（上次失败就是因为盲目 sdkmanager 装固定版本号）
       - name: 探测可用 NDK
