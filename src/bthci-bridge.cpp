@@ -887,8 +887,11 @@ int main(int argc, char** argv) {
               "把 HAL 客户端位和 hci0 还给安卓（桥与安卓蓝牙栈不能同时存在）");
           break;
         }
+        // 字段名带 sysfs 是因为它**不是**适配器状态：桥跑在安卓侧，那里没有
+        // /sys/class/bluetooth/hci0（09-30 真轮实测：这里恒定打 NODEV，而容器侧 hciconfig
+        // 同期是 `UP RUNNING PSCAN ... errors:0`）。旧写法读起来像"设备没了"，会带错方向。
         char fl[64] = "?";
-        FILE* g = popen("cat /sys/class/bluetooth/hci0/flags 2>/dev/null || echo NODEV", "r");
+        FILE* g = popen("cat /sys/class/bluetooth/hci0/flags 2>/dev/null || echo NO-SYSFS-ON-ANDROID", "r");
         if (g) {
           if (!fgets(fl, sizeof(fl), g)) snprintf(fl, sizeof(fl), "ERR");
           pclose(g);
@@ -904,7 +907,7 @@ int main(int argc, char** argv) {
             snprintf(oc, sizeof(oc), "%d 条，最老 op=0x%04x 等 %lldms",
                      (int)g_outstanding.size(), oop, now_ms() - oldest);
         }
-        log("状态 hci0.flags=%s 转发=%llu 收回=%llu 回调=%llu event=%llu HALfd=%d rfkill.soft=%d"
+        log("状态 hci0.sysfs=%s 转发=%llu 收回=%llu 回调=%llu event=%llu HALfd=%d rfkill.soft=%d"
             " 在途命令=[%s] 写pty=[full=%llu 短写=%llu 再次=EAGAIN=%llu 错=%llu 丢=%llu"
             " 最大阻塞=%lldms] 拆包=[多=%llu 短=%llu 怪=%llu]",
             fl, (unsigned long long)g_toHal, (unsigned long long)g_toKernel,
