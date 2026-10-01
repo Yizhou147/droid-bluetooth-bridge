@@ -14,6 +14,8 @@ on:
       - "Makefile"
       - "build.sh"
       - ".github/workflows/build.yml"
+    tags:
+      - "v*"          # 打 tag 才出 release 资产（安装器只认 release）
 
 jobs:
   build:
@@ -93,3 +95,33 @@ jobs:
           name: bthci-bridge-aarch64
           path: out/bthci-bridge
           if-no-files-found: error
+
+  # 安装器需要公开 release 资产：Actions artifact 要登录才能取、镜像站也拿不到。
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: bthci-bridge-aarch64
+          path: in/
+
+      - name: 打包
+        run: |
+          set -euo pipefail
+          # 交付名就是设备侧要放的名字：接管脚本默认 BT_BIN=/data/local/tmp/bthci-bridge-v2
+          STAGE=bt-bridge
+          rm -rf "$STAGE"; mkdir -p "$STAGE"
+          cp in/bthci-bridge "$STAGE"/bthci-bridge-v2
+          file "$STAGE/bthci-bridge-v2" | grep -q 'ARM aarch64'
+          tar -czf bt-bridge-aarch64.tar.gz "$STAGE"
+          rm -rf "$STAGE"
+          sha256sum bt-bridge-aarch64.tar.gz
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          draft: true          # 与主仓同一规矩：CI 永不自动公开
+          files: bt-bridge-aarch64.tar.gz
